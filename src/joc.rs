@@ -384,6 +384,80 @@ pub fn analyze_bands(
         .collect()
 }
 
+/// Quantization-aware refinement of the per-band mixing matrices.
+///
+/// The float LS solution is quantized coefficient-by-coefficient. When the core channels are
+/// correlated, nearest rounding is not necessarily the minimizer of the decoder error
+/// `D(m) = P - 2 mᵀr + mᵀRm`. Starting from the nearest quantized codes, try ±1 code for each
+/// coefficient and keep moves that reduce `D`; repeat for a few rounds. `P` is constant and is
+/// omitted. The update uses `g = Rm - r`, so a trial is O(1) and an accepted move is O(5).
+pub fn refine_quantized(
+    core_cov: &[[[f64; 5]; 5]; ENC_BANDS],
+    cross: &[[[f64; 5]; ENC_BANDS]],
+    matrices: &mut [[[f32; 5]; ENC_BANDS]],
+    quant: u8,
+    rounds: usize,
+) {
+    let (center, range, step) = quant_params(quant);
+    let step = step as f64;
+    for (obj, obj_cross) in cross.iter().enumerate() {
+        let mtx = &mut matrices[obj];
+        for b in 0..ENC_BANDS {
+            let r = &core_cov[b];
+            let c = &obj_cross[b];
+            let mut q = [0i32; 5];
+            for ch in 0..5 {
+                q[ch] = quantize_gain_mode(mtx[b][ch], quant);
+            }
+            // g = R m - r for the current quantized m.
+            let mut g = [0f64; 5];
+            for i in 0..5 {
+                let mut v = 0.0;
+                for j in 0..5 {
+                    v += r[i][j] * ((q[j] - center) as f64 * step);
+                }
+                g[i] = v - c[i];
+            }
+            for _ in 0..rounds {
+                let mut changed = false;
+                for ch in 0..5 {
+                    let old = q[ch];
+                    let mut best_d = 0.0f64; // no move
+                    let mut best_q = old;
+                    if old + 1 < range {
+                        let d = 2.0 * step * g[ch] + step * step * r[ch][ch];
+                        if d < best_d {
+                            best_d = d;
+                            best_q = old + 1;
+                        }
+                    }
+                    if old > 0 {
+                        let d = -2.0 * step * g[ch] + step * step * r[ch][ch];
+                        if d < best_d {
+                            best_d = d;
+                            best_q = old - 1;
+                        }
+                    }
+                    if best_q != old {
+                        let delta = (best_q - old) as f64 * step;
+                        for i in 0..5 {
+                            g[i] += delta * r[i][ch];
+                        }
+                        q[ch] = best_q;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            for ch in 0..5 {
+                mtx[b][ch] = (q[ch] - center) as f32 * step as f32;
+            }
+        }
+    }
+}
+
 /// Gauss-Jordan inverse of a (well-conditioned, ridge-regularized) 5×5 matrix.
 fn invert5(a: &[[f64; 5]; 5]) -> [[f64; 5]; 5] {
     let mut m = *a;
@@ -498,6 +572,58 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_refinement_reduces_modeled_error() {
+        // Correlated two-channel case: nearest rounding of the float LS solution is not the
+        // minimizer of D(m) = P - 2mᵀr + mᵀRm. The coordinate descent must strictly improve it.
+        let mut core = [[[0f64; 5]; 5]; ENC_BANDS];
+        let mut cross = vec![[[0f64; 5]; ENC_BANDS]; 1];
+        for b in 0..ENC_BANDS {
+            core[b][0][0] = 1.569;
+            core[b][0][1] = 0.77;
+            core[b][1][0] = 0.77;
+            core[b][1][1] = 1.058;
+            cross[0][b][0] = -0.458;
+            cross[0][b][1] = 0.22;
+        }
+        let mut start = vec![[[0f32; 5]; ENC_BANDS]; 1];
+        for row in &mut start[0] {
+            *row = [-0.613, 0.654, 0.0, 0.0, 0.0];
+        }
+        let mut nearest = start.clone();
+        refine_quantized(&core, &cross, &mut nearest, 1, 0);
+        let mut refined = start.clone();
+        refine_quantized(&core, &cross, &mut refined, 1, 3);
+        let d = |m: &[[f32; 5]; ENC_BANDS]| -> f64 {
+            let mut total = 0.0;
+            for b in 0..ENC_BANDS {
+                let mf: [f64; 5] = std::array::from_fn(|i| m[b][i] as f64);
+                let r = &core[b];
+                let c = &cross[0][b];
+                let mut v = 0.0;
+                for i in 0..5 {
+                    for j in 0..5 {
+                        v += mf[i] * r[i][j] * mf[j];
+                    }
+                    v -= 2.0 * mf[i] * c[i];
+                }
+                total += v;
+            }
+            total
+        };
+        assert!(
+            d(&refined[0]) < d(&nearest[0]) - 1e-6,
+            "refined {} vs nearest {}",
+            d(&refined[0]),
+            d(&nearest[0])
+        );
+        for row in &refined[0] {
+            for v in row {
+                assert!(((v * 10.0).round() - v * 10.0).abs() < 1e-4, "{v} off grid");
             }
         }
     }

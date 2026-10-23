@@ -32,6 +32,8 @@ const BINS_PER_SUBBAND: usize = FFT_SIZE / 128;
 const SMOOTH: f64 = 0.9;
 /// Zero a band's row when the object has no significant energy there in the current frame.
 const POWER_GATE: f64 = 1e-8;
+/// Coordinate-descent rounds for quantization-aware matrix refinement.
+const REFINE_ROUNDS: usize = 2;
 
 /// Per-frame spectral statistics (real part only — the signals are real, so the negative-frequency
 /// contribution is the conjugate).
@@ -510,7 +512,18 @@ impl JocAnalyzer {
         } else {
             self.smoothed.blend(&self.raw, SMOOTH);
         }
-        self.matrices = joc::analyze_bands(&self.smoothed.core, &self.smoothed.cross);
+        let mut matrices = joc::analyze_bands(&self.smoothed.core, &self.smoothed.cross);
+        // Quantization-aware coordinate descent; most frames use fine per-band matrices. The
+        // adaptive encoder can still fall back to coarse/broadband for the few frames that do
+        // not fit the skip field.
+        joc::refine_quantized(
+            &self.smoothed.core,
+            &self.smoothed.cross,
+            &mut matrices,
+            1,
+            REFINE_ROUNDS,
+        );
+        self.matrices = matrices;
         for o in 0..self.nobj {
             for b in 0..ENC_BANDS {
                 if self.raw.power[o][b] < self.raw.core_energy(b) * POWER_GATE {
