@@ -52,6 +52,12 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum JocSelect {
+    Greedy,
+    Knapsack,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Inspect a DAMF master: report bed/object layout, audio essence, and metadata summary.
@@ -123,6 +129,16 @@ enum Command {
         /// Decoder delay in samples to skip at the start of `--core-pcm` (ffmpeg E-AC-3: 256).
         #[arg(long, default_value_t = 256)]
         core_delay: usize,
+        /// Lagrange multiplier for Huffman-aware rate-distortion matrix refinement
+        /// (D + lambda*B; 0 disables it). Units: distortion per bit.
+        #[arg(long, default_value_t = 1e-3)]
+        joc_lambda: f64,
+        /// EMDF skip-field byte budget used for diagnostics (511 is the hard limit).
+        #[arg(long, default_value_t = 511)]
+        emdf_budget: usize,
+        /// Per-object fine/coarse fallback selection.
+        #[arg(long, value_enum, default_value = "knapsack")]
+        joc_select: JocSelect,
     },
     /// Find + decode the JOC payload in a real DD+ Atmos stream (EMDF at any bit offset, e.g.
     /// skip-field carriage). Dumps one frame in detail, then aggregate stats over all frames.
@@ -428,7 +444,20 @@ fn main() -> Result<()> {
             pan,
             core_pcm,
             core_delay,
-        } => atmos_inject(&core, &atmos, &out, pan, core_pcm.as_deref(), core_delay),
+            joc_lambda,
+            emdf_budget,
+            joc_select,
+        } => atmos_inject(
+            &core,
+            &atmos,
+            &out,
+            pan,
+            core_pcm.as_deref(),
+            core_delay,
+            joc_lambda,
+            emdf_budget,
+            joc_select,
+        ),
         Command::Jocprobe { input, frame } => jocprobe(&input, frame),
         Command::Walkprobe { input } => walkprobe(&input),
         Command::Graft {
@@ -682,6 +711,7 @@ fn load_ctx(
     pan: render::PanMode,
     core_pcm: Option<&Path>,
     core_delay: usize,
+    joc_lambda: f64,
 ) -> Result<AtmosCtx> {
     let manifest = damf::Manifest::load(atmos)?;
     let dir = atmos.parent().unwrap_or_else(|| Path::new("."));
@@ -740,6 +770,7 @@ fn load_ctx(
         pan,
         core_pcm,
         core_delay,
+        joc_lambda,
     )
     .context("setting up per-band JOC analysis")?;
 
@@ -769,6 +800,7 @@ fn frame_objects(ctx: &AtmosCtx, i: usize) -> Vec<emdf::ObjectPos> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn atmos_inject(
     core: &Path,
     atmos: &Path,
@@ -776,8 +808,15 @@ fn atmos_inject(
     pan: render::PanMode,
     core_pcm: Option<&Path>,
     core_delay: usize,
+    joc_lambda: f64,
+    emdf_budget: usize,
+    joc_select: JocSelect,
 ) -> Result<()> {
-    let mut ctx = load_ctx(core, atmos, pan, core_pcm, core_delay)?;
+    anyhow::ensure!(
+        (1..=511).contains(&emdf_budget),
+        "EMDF budget must be 1..=511 bytes"
+    );
+    let mut ctx = load_ctx(core, atmos, pan, core_pcm, core_delay, joc_lambda)?;
     let object_count = ctx.nobj + 1; // + LFE bed
     let complexity = object_count.min(16) as u8;
     // addbsi §8.3: reserved(7)=0 · flag_ec3_extension_type_a(1)=1 · complexity_index_type_a(8).
@@ -805,9 +844,14 @@ fn atmos_inject(
         let oamd = emdf::encode_oamd(&objs, true);
         let start = ctx.start_samples[i];
         let end = start + f.samples() as u64;
-        let mtx = ctx.joc.matrices_for_frame(start, end).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("JOC band analysis at frame {i}: {e}"))
-        })?;
+        let mtx = ctx
+            .joc
+            .matrices_for_frame(start, end)
+            .map_err(|e| {
+                std::io::Error::new(e.kind(), format!("JOC band analysis at frame {i}: {e}"))
+            })?
+            .to_vec();
+        let rates = ctx.joc.object_rates().to_vec();
         // Real Dolby DD+ JOC streams carry two small constant companion payloads after JOC
         // (id 2 = [04 94 80], id 1 = [02 00]); a decoder may require these to treat the stream as
         // object audio. Match the working EAC3-JOC ATMOS file's order: OAMD(11), JOC(14), 2, 1.
@@ -821,13 +865,81 @@ fn atmos_inject(
         };
         let seq = (i % 1024) as u16;
         // The skip field's 9-bit skipl can carry at most 511 bytes. Prefer full 12-band fine
-        // matrices; a handful of transient-heavy frames would overflow, so fall back to coarse
-        // quantization first, then to the broadband form (all bands equal) for those frames only.
+        // matrices. If a frame overflows, switch individual objects to coarse quantization first
+        // (the JOC syntax has a per-object joc_quant_table_idx), then fall back to the broadband
+        // form for extreme frames. This avoids downgrading the whole frame for one expensive
+        // object.
+        let nobj = ctx.nobj;
         let mut chosen: Option<(Vec<u8>, u8)> = None; // (EMDF, mode)
-        for (quant, per_band, mode) in [(1, true, 0u8), (0, true, 1), (1, false, 2), (0, false, 3)]
-        {
-            let p = make_payload(joc::encode_joc_ex(mtx, seq, quant, per_band));
-            let fits = p.len() <= 511;
+        for per_band in [true, false] {
+            let mut quants = vec![1u8; nobj];
+            let mut p = make_payload(joc::encode_joc_per_object(&mtx, seq, &quants, per_band));
+            if p.len() > emdf_budget {
+                if per_band && matches!(joc_select, JocSelect::Knapsack) {
+                    // Exact per-object knapsack: minimise summed coarse distortion for the
+                    // bit reduction needed to fit the budget. Bit costs are additive because
+                    // JOC matrix data is per-object.
+                    let rate_vec: Vec<(usize, usize, f64)> = rates
+                        .iter()
+                        .map(|r| (r.fine_bits, r.coarse_bits, r.coarse_distortion))
+                        .collect();
+                    let header = joc::joc_header_bits(nobj);
+                    let fine_bits: usize = rates.iter().map(|r| r.fine_bits).sum();
+                    let joc_bytes_fine = (header + fine_bits).div_ceil(8);
+                    let fixed = p.len().saturating_sub(joc_bytes_fine);
+                    let mut budget = emdf_budget;
+                    let mut selected: Option<(Vec<u8>, Vec<u8>)> = None;
+                    for _ in 0..4 {
+                        let avail_bits = budget.saturating_sub(fixed + 1) * 8;
+                        let matrix_budget = avail_bits.saturating_sub(header);
+                        if let Some(mask) = joc::select_coarse_objects(&rate_vec, matrix_budget) {
+                            let q2: Vec<u8> = mask.iter().map(|&c| if c { 0 } else { 1 }).collect();
+                            let p2 =
+                                make_payload(joc::encode_joc_per_object(&mtx, seq, &q2, per_band));
+                            if p2.len() <= budget {
+                                selected = Some((q2, p2));
+                                break;
+                            }
+                        }
+                        if budget == 1 {
+                            break;
+                        }
+                        budget -= 1;
+                    }
+                    if let Some((q2, p2)) = selected {
+                        quants = q2;
+                        p = p2;
+                    } else {
+                        quants = vec![0u8; nobj];
+                        p = make_payload(joc::encode_joc_per_object(&mtx, seq, &quants, per_band));
+                    }
+                } else {
+                    // Greedy fallback (also used for the broadband mode, whose bit costs are
+                    // not in the per-band rate table).
+                    let mut order = Vec::with_capacity(nobj);
+                    for obj in 0..nobj {
+                        let mut q2 = quants.clone();
+                        q2[obj] = 0;
+                        let p2 = make_payload(joc::encode_joc_per_object(&mtx, seq, &q2, per_band));
+                        order.push((p.len().saturating_sub(p2.len()), obj));
+                    }
+                    order.sort_by_key(|b| std::cmp::Reverse(b.0));
+                    for (_, obj) in order {
+                        quants[obj] = 0;
+                        p = make_payload(joc::encode_joc_per_object(&mtx, seq, &quants, per_band));
+                        if p.len() <= emdf_budget {
+                            break;
+                        }
+                    }
+                }
+            }
+            let mode = match (per_band, quants.contains(&0)) {
+                (true, false) => 0,
+                (true, true) => 1,
+                (false, false) => 2,
+                (false, true) => 3,
+            };
+            let fits = p.len() <= emdf_budget;
             if chosen
                 .as_ref()
                 .is_none_or(|(best, _)| fits || p.len() < best.len())

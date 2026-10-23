@@ -34,6 +34,8 @@ const SMOOTH: f64 = 0.9;
 const POWER_GATE: f64 = 1e-8;
 /// Coordinate-descent rounds for quantization-aware matrix refinement.
 const REFINE_ROUNDS: usize = 2;
+/// Sweeps for the Huffman-aware rate-distortion refinement.
+const RD_PASSES: usize = 1;
 
 /// Per-frame spectral statistics (real part only — the signals are real, so the negative-frequency
 /// contribution is the conjugate).
@@ -190,6 +192,14 @@ impl CorePcm {
     }
 }
 
+/// Per-object fine/coarse costs for the exact fallback knapsack.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ObjectRate {
+    pub fine_bits: usize,
+    pub coarse_bits: usize,
+    pub coarse_distortion: f64,
+}
+
 /// Streaming per-frame JOC band analyzer over a DAMF essence file.
 pub(crate) struct JocAnalyzer {
     fft: Arc<dyn Fft<f32>>,
@@ -212,6 +222,8 @@ pub(crate) struct JocAnalyzer {
     /// Optional decoded core PCM (actual lossy core) instead of synthesizing the ideal downmix.
     core_pcm: Option<CorePcm>,
     core_block: Vec<f32>,
+    joc_lambda: f64,
+    rates: Vec<ObjectRate>,
 
     block: Vec<f32>,
     fill: usize,
@@ -232,6 +244,7 @@ impl JocAnalyzer {
         pan_mode: render::PanMode,
         core_pcm_path: Option<&Path>,
         core_delay: usize,
+        joc_lambda: f64,
     ) -> Result<Self> {
         let caf = damf::read_caf_info(caf_path)?;
         ensure!(
@@ -323,6 +336,8 @@ impl JocAnalyzer {
             samples_read: 0,
             core_pcm,
             core_block: Vec::new(),
+            joc_lambda,
+            rates: vec![ObjectRate::default(); nobj],
             block: vec![0.0; nsig * FFT_SIZE],
             fill: 0,
             spectra: vec![0.0; nsig * (FFT_SIZE / 2 + 1) * 2],
@@ -499,6 +514,10 @@ impl JocAnalyzer {
         self.frame_blocks += 1;
     }
 
+    pub(crate) fn object_rates(&self) -> &[ObjectRate] {
+        &self.rates
+    }
+
     fn finish_frame(&mut self) {
         let blocks = self.frame_blocks;
         self.frame_blocks = 0;
@@ -523,6 +542,13 @@ impl JocAnalyzer {
             1,
             REFINE_ROUNDS,
         );
+        joc::refine_rate_distortion(
+            &self.smoothed.core,
+            &self.smoothed.cross,
+            &mut matrices,
+            self.joc_lambda,
+            RD_PASSES,
+        );
         self.matrices = matrices;
         for o in 0..self.nobj {
             for b in 0..ENC_BANDS {
@@ -530,6 +556,25 @@ impl JocAnalyzer {
                     self.matrices[o][b] = [0.0; 5];
                 }
             }
+        }
+        for o in 0..self.nobj {
+            let fine = &self.matrices[o];
+            let mut coarse = [[0f32; 5]; ENC_BANDS];
+            for b in 0..ENC_BANDS {
+                for ch in 0..5 {
+                    coarse[b][ch] = joc::quantized_value(fine[b][ch], 0);
+                }
+            }
+            let fine_bits = joc::matrix_bits_for_object(fine, 1, true);
+            let coarse_bits = joc::matrix_bits_for_object(&coarse, 0, true);
+            let d_fine = joc::object_distortion(&self.smoothed.core, &self.smoothed.cross[o], fine);
+            let d_coarse =
+                joc::object_distortion(&self.smoothed.core, &self.smoothed.cross[o], &coarse);
+            self.rates[o] = ObjectRate {
+                fine_bits,
+                coarse_bits,
+                coarse_distortion: (d_coarse - d_fine).max(0.0),
+            };
         }
         self.raw.clear();
     }
