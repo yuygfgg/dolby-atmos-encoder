@@ -198,7 +198,7 @@ pub const ENC_BANDS: usize = 12;
 /// Largest magnitude the fine quantizer can represent (±9.5).
 pub const MAX_GAIN: f32 = 9.5;
 /// Diagonal loading relative to the per-band core covariance trace.
-const RIDGE: f64 = 3e-3;
+const RIDGE: f64 = 1e-3;
 
 /// Symbol → (code, bit length), derived from a decode tree at startup.
 struct HuffEnc {

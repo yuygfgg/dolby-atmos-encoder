@@ -121,6 +121,73 @@ impl Stats {
     }
 }
 
+/// Optional decoded 5.1 core PCM feed. The product pipeline will get this from
+/// ffmpeg-next; for research/CLI use it is a raw f32le pipe (`ffmpeg ... -f f32le -`).
+struct CorePcm {
+    reader: Box<dyn Read>,
+    channels: usize,
+    delay: usize,
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+impl CorePcm {
+    fn new(reader: Box<dyn Read>, channels: usize, delay: usize) -> Self {
+        Self {
+            reader,
+            channels,
+            delay,
+            buf: Vec::new(),
+            eof: false,
+        }
+    }
+
+    /// Read `frames` frames of interleaved f32le, skip the decoder delay once, and
+    /// deinterleave L,R,C,Ls,Rs into `dst` (5 floats/frame). Missing samples at EOF
+    /// are zero-filled.
+    fn read_block(&mut self, frames: usize, dst: &mut Vec<f32>) -> std::io::Result<()> {
+        let ch = self.channels;
+        let skip = self.delay;
+        let raw_frames = skip + frames;
+        let bytes = raw_frames * ch * 4;
+        self.buf.resize(bytes, 0);
+        let mut got = 0usize;
+        while got < bytes && !self.eof {
+            match self.reader.read(&mut self.buf[got..bytes]) {
+                Ok(0) => self.eof = true,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let complete = got / (ch * 4);
+        let start = skip.min(complete);
+        self.delay = skip - start;
+        let take = complete.saturating_sub(start).min(frames);
+        dst.clear();
+        dst.resize(frames * 5, 0.0);
+        for i in 0..take {
+            let base = (start + i) * ch * 4;
+            let sample = |c: usize| -> f32 {
+                let p = base + c * 4;
+                f32::from_le_bytes([
+                    self.buf[p],
+                    self.buf[p + 1],
+                    self.buf[p + 2],
+                    self.buf[p + 3],
+                ])
+            };
+            let o = i * 5;
+            dst[o] = sample(0); // L
+            dst[o + 1] = sample(1); // R
+            dst[o + 2] = sample(2); // C
+            dst[o + 3] = sample(4); // Ls
+            dst[o + 4] = sample(5); // Rs
+        }
+        Ok(())
+    }
+}
+
 /// Streaming per-frame JOC band analyzer over a DAMF essence file.
 pub(crate) struct JocAnalyzer {
     fft: Arc<dyn Fft<f32>>,
@@ -140,6 +207,10 @@ pub(crate) struct JocAnalyzer {
     eof: bool,
     samples_read: u64,
 
+    /// Optional decoded core PCM (actual lossy core) instead of synthesizing the ideal downmix.
+    core_pcm: Option<CorePcm>,
+    core_block: Vec<f32>,
+
     block: Vec<f32>,
     fill: usize,
     spectra: Vec<f32>,
@@ -157,6 +228,8 @@ impl JocAnalyzer {
         dir: &Path,
         pres: &damf::Presentation,
         pan_mode: render::PanMode,
+        core_pcm_path: Option<&Path>,
+        core_delay: usize,
     ) -> Result<Self> {
         let caf = damf::read_caf_info(caf_path)?;
         ensure!(
@@ -207,6 +280,25 @@ impl JocAnalyzer {
             *range = (lo, hi);
         }
 
+        let core_pcm = match core_pcm_path {
+            Some(path) => {
+                let reader: Box<dyn Read> = if path == Path::new("-") {
+                    Box::new(std::io::stdin())
+                } else {
+                    Box::new(
+                        File::open(path)
+                            .with_context(|| format!("open core PCM {}", path.display()))?,
+                    )
+                };
+                ensure!(
+                    core_delay < 48000,
+                    "core delay {core_delay} samples is implausible"
+                );
+                Some(CorePcm::new(reader, 6, core_delay))
+            }
+            None => None,
+        };
+
         let nsig = 5 + nobj;
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
@@ -227,6 +319,8 @@ impl JocAnalyzer {
             inbuf: Vec::new(),
             eof: false,
             samples_read: 0,
+            core_pcm,
+            core_block: Vec::new(),
             block: vec![0.0; nsig * FFT_SIZE],
             fill: 0,
             spectra: vec![0.0; nsig * (FFT_SIZE / 2 + 1) * 2],
@@ -268,12 +362,27 @@ impl JocAnalyzer {
                 }
             }
             let complete = got / (self.channels * 3);
+            if let Some(core) = &mut self.core_pcm {
+                core.read_block(want, &mut self.core_block)?;
+            }
             for s in 0..want {
                 let t = self.samples_read;
-                if s < complete {
-                    self.consume_sample(t, Some(s * self.channels * 3));
+                let core = if self.core_pcm.is_some() {
+                    let o = s * 5;
+                    Some([
+                        self.core_block[o],
+                        self.core_block[o + 1],
+                        self.core_block[o + 2],
+                        self.core_block[o + 3],
+                        self.core_block[o + 4],
+                    ])
                 } else {
-                    self.consume_sample(t, None);
+                    None
+                };
+                if s < complete {
+                    self.consume_sample(t, Some(s * self.channels * 3), core);
+                } else {
+                    self.consume_sample(t, None, core);
                 }
                 self.samples_read += 1;
             }
@@ -281,7 +390,7 @@ impl JocAnalyzer {
         Ok(())
     }
 
-    fn consume_sample(&mut self, t: u64, offset: Option<usize>) {
+    fn consume_sample(&mut self, t: u64, offset: Option<usize>, core_override: Option<[f32; 5]>) {
         for o in 0..self.nobj {
             self.obj_vals[o] = match offset {
                 Some(base) => {
@@ -296,18 +405,23 @@ impl JocAnalyzer {
             };
         }
 
-        let mut core = [0f32; 5];
-        for o in 0..self.nobj {
-            let v = self.obj_vals[o];
-            if v == 0.0 {
-                self.objects[o].gains_at(t);
-                continue;
+        let core = if let Some(core) = core_override {
+            core
+        } else {
+            let mut core = [0f32; 5];
+            for o in 0..self.nobj {
+                let v = self.obj_vals[o];
+                if v == 0.0 {
+                    self.objects[o].gains_at(t);
+                    continue;
+                }
+                let g = self.objects[o].gains_at(t);
+                for ch in 0..5 {
+                    core[ch] += v * g[ch];
+                }
             }
-            let g = self.objects[o].gains_at(t);
-            for ch in 0..5 {
-                core[ch] += v * g[ch];
-            }
-        }
+            core
+        };
 
         let n = FFT_SIZE;
         let pos = self.fill;
@@ -405,5 +519,33 @@ impl JocAnalyzer {
             }
         }
         self.raw.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn core_pcm_skips_delay_and_maps_51_to_five() {
+        let frames = [
+            [10.0f32, 11.0, 12.0, 13.0, 14.0, 15.0],
+            [20.0, 21.0, 22.0, 23.0, 24.0, 25.0],
+            [30.0, 31.0, 32.0, 33.0, 34.0, 35.0],
+        ];
+        let mut bytes = Vec::new();
+        for f in frames {
+            for s in f {
+                bytes.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        let mut core = CorePcm::new(Box::new(Cursor::new(bytes)), 6, 1);
+        let mut dst = Vec::new();
+        core.read_block(2, &mut dst).unwrap();
+        assert_eq!(
+            dst,
+            vec![20.0, 21.0, 22.0, 24.0, 25.0, 30.0, 31.0, 32.0, 34.0, 35.0]
+        );
     }
 }

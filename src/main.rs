@@ -116,6 +116,13 @@ enum Command {
         /// Downmix panning law used for JOC analysis (must match the `downmix` run).
         #[arg(long, value_enum, default_value = "hard")]
         pan: render::PanMode,
+        /// Optional decoded 5.1 core PCM (raw f32le, 6 channels, 48 kHz) for JOC analysis.
+        /// Use `-` to read from stdin. Omit to synthesize the ideal downmix.
+        #[arg(long)]
+        core_pcm: Option<PathBuf>,
+        /// Decoder delay in samples to skip at the start of `--core-pcm` (ffmpeg E-AC-3: 256).
+        #[arg(long, default_value_t = 256)]
+        core_delay: usize,
     },
     /// Find + decode the JOC payload in a real DD+ Atmos stream (EMDF at any bit offset, e.g.
     /// skip-field carriage). Dumps one frame in detail, then aggregate stats over all frames.
@@ -419,7 +426,9 @@ fn main() -> Result<()> {
             atmos,
             out,
             pan,
-        } => atmos_inject(&core, &atmos, &out, pan),
+            core_pcm,
+            core_delay,
+        } => atmos_inject(&core, &atmos, &out, pan, core_pcm.as_deref(), core_delay),
         Command::Jocprobe { input, frame } => jocprobe(&input, frame),
         Command::Walkprobe { input } => walkprobe(&input),
         Command::Graft {
@@ -667,7 +676,13 @@ struct AtmosCtx {
     joc: joc_analysis::JocAnalyzer,
 }
 
-fn load_ctx(core: &Path, atmos: &Path, pan: render::PanMode) -> Result<AtmosCtx> {
+fn load_ctx(
+    core: &Path,
+    atmos: &Path,
+    pan: render::PanMode,
+    core_pcm: Option<&Path>,
+    core_delay: usize,
+) -> Result<AtmosCtx> {
     let manifest = damf::Manifest::load(atmos)?;
     let dir = atmos.parent().unwrap_or_else(|| Path::new("."));
     let pres = manifest
@@ -718,8 +733,15 @@ fn load_ctx(core: &Path, atmos: &Path, pan: render::PanMode) -> Result<AtmosCtx>
     // Per-band JOC statistics are computed from the essence while the core streams through the
     // injector, so no per-frame covariance table is ever stored (memory stays O(frames) for the
     // header grid only).
-    let joc = joc_analysis::JocAnalyzer::new(&dir.join(&pres.audio), dir, pres, pan)
-        .context("setting up per-band JOC analysis")?;
+    let joc = joc_analysis::JocAnalyzer::new(
+        &dir.join(&pres.audio),
+        dir,
+        pres,
+        pan,
+        core_pcm,
+        core_delay,
+    )
+    .context("setting up per-band JOC analysis")?;
 
     Ok(AtmosCtx {
         timelines,
@@ -747,8 +769,15 @@ fn frame_objects(ctx: &AtmosCtx, i: usize) -> Vec<emdf::ObjectPos> {
         .collect()
 }
 
-fn atmos_inject(core: &Path, atmos: &Path, out: &Path, pan: render::PanMode) -> Result<()> {
-    let mut ctx = load_ctx(core, atmos, pan)?;
+fn atmos_inject(
+    core: &Path,
+    atmos: &Path,
+    out: &Path,
+    pan: render::PanMode,
+    core_pcm: Option<&Path>,
+    core_delay: usize,
+) -> Result<()> {
+    let mut ctx = load_ctx(core, atmos, pan, core_pcm, core_delay)?;
     let object_count = ctx.nobj + 1; // + LFE bed
     let complexity = object_count.min(16) as u8;
     // addbsi §8.3: reserved(7)=0 · flag_ec3_extension_type_a(1)=1 · complexity_index_type_a(8).
