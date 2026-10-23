@@ -78,6 +78,8 @@ pub struct Event {
     /// Room-anchored position `[x, y, z]` (x: left -1 .. right +1, y: back -1 .. front +1,
     /// z: floor 0 .. ceiling 1). Absent for bed/LFE elements.
     pub pos: Option<Vec<f64>>,
+    /// Movement ramp length in samples. Only written when it changes for an element.
+    pub ramp_length: Option<u64>,
 }
 
 impl Metadata {

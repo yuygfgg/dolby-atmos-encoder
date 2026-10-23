@@ -1067,7 +1067,7 @@ pub(crate) fn field_offsets(aligned: &[u8]) -> Option<EmdfFieldOffsets> {
     if r.read(16) != 0x5838 {
         return None;
     }
-    let _emdf_len = r.read(16);
+    let emdf_len = r.read(16) as usize;
     let _version = r.read(2);
     let key_id_bit = r.pos; // 34 when version == 0 (the only version genuine streams use)
     let _key = r.read(3);
@@ -1114,6 +1114,12 @@ pub(crate) fn field_offsets(aligned: &[u8]) -> Option<EmdfFieldOffsets> {
     let prim_bits = lenmap[r.read(2) as usize];
     let sec_bits = lenmap[r.read(2) as usize];
     let protection_start = r.pos;
+    let container_bits = 32 + emdf_len * 8;
+    if container_bits > aligned.len() * 8
+        || protection_start + prim_bits as usize + sec_bits as usize > container_bits
+    {
+        return None;
+    }
     Some(EmdfFieldOffsets {
         key_id_bit,
         protection_start,
