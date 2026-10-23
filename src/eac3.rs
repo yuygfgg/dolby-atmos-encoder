@@ -802,11 +802,9 @@ pub fn inject_frame_skipfield(
     emdf: &[u8],
     target_block: usize,
 ) -> Option<Vec<u8>> {
-    assert!(
-        emdf.len() <= 511,
-        "EMDF {} B exceeds skipl 9-bit max",
-        emdf.len()
-    );
+    if emdf.len() > 511 {
+        return None; // skipl (9 bits) cannot represent it; caller falls back to auxdata
+    }
     let l = frame.len() * 8;
     let (p, addbsie) = bsi_addbsie_pos(frame, info)?;
     if addbsie != 0 {
@@ -1045,11 +1043,22 @@ where
 ///
 /// For the same input and an equivalent transform, the output is byte-for-byte identical to walking
 /// [`parse_frames`] over the whole buffer and transforming each frame (see the tests).
-pub fn transform_frames_io<R, W, F>(reader: R, writer: W, process: F) -> io::Result<usize>
+pub fn transform_frames_io<R, W, F>(reader: R, writer: W, mut process: F) -> io::Result<usize>
 where
     R: Read,
     W: Write,
     F: FnMut(&FrameInfo, usize, &[u8]) -> Vec<u8>,
+{
+    transform_frames_io_try(reader, writer, |f, i, b| Ok(process(f, i, b)))
+}
+
+/// Like [`transform_frames_io`], but the per-frame transform may fail; the first error aborts the
+/// stream and is returned to the caller.
+pub fn transform_frames_io_try<R, W, F>(reader: R, writer: W, process: F) -> io::Result<usize>
+where
+    R: Read,
+    W: Write,
+    F: FnMut(&FrameInfo, usize, &[u8]) -> io::Result<Vec<u8>>,
 {
     transform_frames_io_chunked(reader, writer, 1 << 22, process) // 4 MiB read granularity
 }
@@ -1063,7 +1072,7 @@ fn transform_frames_io_chunked<R, W, F>(
 where
     R: Read,
     W: Write,
-    F: FnMut(&FrameInfo, usize, &[u8]) -> Vec<u8>,
+    F: FnMut(&FrameInfo, usize, &[u8]) -> io::Result<Vec<u8>>,
 {
     let chunk = chunk.max(8);
     let mut buf: Vec<u8> = Vec::new();
@@ -1124,7 +1133,7 @@ where
             if pos + size > buf.len() {
                 break; // frame not fully buffered yet
             }
-            let outframe = process(&info, frame_idx, &buf[pos..pos + size]);
+            let outframe = process(&info, frame_idx, &buf[pos..pos + size])?;
             writer.write_all(&outframe)?;
             frame_idx += 1;
             pos += size;
@@ -1258,7 +1267,7 @@ mod stream_tests {
             let mut out = Vec::new();
             let n =
                 transform_frames_io_chunked(Cursor::new(&data), &mut out, chunk, |_i, _n, f| {
-                    f.to_vec()
+                    Ok(f.to_vec())
                 })
                 .unwrap();
             assert_eq!(out, data, "identity must reproduce input (chunk={chunk})");
@@ -1271,8 +1280,10 @@ mod stream_tests {
         let data = synth_stream();
         let mem = inject_stream(&data, |_f, _i| None); // None => copy each frame verbatim
         let mut streamed = Vec::new();
-        transform_frames_io_chunked(Cursor::new(&data), &mut streamed, 9, |_i, _n, f| f.to_vec())
-            .unwrap();
+        transform_frames_io_chunked(Cursor::new(&data), &mut streamed, 9, |_i, _n, f| {
+            Ok(f.to_vec())
+        })
+        .unwrap();
         assert_eq!(streamed, mem);
         assert_eq!(streamed, data);
     }
@@ -1286,7 +1297,7 @@ mod stream_tests {
         data.extend_from_slice(&synth_frame(6, 0xBB));
         data.push(0x55); // trailing
         let mut out = Vec::new();
-        transform_frames_io_chunked(Cursor::new(&data), &mut out, 5, |_i, _n, f| f.to_vec())
+        transform_frames_io_chunked(Cursor::new(&data), &mut out, 5, |_i, _n, f| Ok(f.to_vec()))
             .unwrap();
         assert_eq!(out, data);
     }
@@ -1318,7 +1329,8 @@ mod stream_tests {
         }
         // Streaming, tiny chunk to force frame/gap splits across reads.
         let mut got = Vec::new();
-        transform_frames_io_chunked(Cursor::new(&data), &mut got, 5, |_i, _n, f| grow(f)).unwrap();
+        transform_frames_io_chunked(Cursor::new(&data), &mut got, 5, |_i, _n, f| Ok(grow(f)))
+            .unwrap();
         assert_eq!(got, want);
     }
 
@@ -1337,7 +1349,10 @@ mod stream_tests {
         assert_eq!(want.len(), 3, "fixture should parse to 3 frames");
         for &chunk in &[8usize, 7, 13, 64, 1024] {
             let got = parse_frames_io_chunked(Cursor::new(&data), chunk).unwrap();
-            assert_eq!(got, want, "parse_frames_io must match parse_frames (chunk={chunk})");
+            assert_eq!(
+                got, want,
+                "parse_frames_io must match parse_frames (chunk={chunk})"
+            );
         }
     }
 }

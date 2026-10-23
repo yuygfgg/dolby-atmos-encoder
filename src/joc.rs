@@ -188,9 +188,17 @@ pub fn decode_joc(payload: &[u8]) -> Result<JocFrame, String> {
 const FINE_CENTER: i32 = 96;
 const FINE_RANGE: i32 = 192;
 const FINE_STEP: f32 = 0.1;
+/// Coarse quantization (quant=0): step 0.2, codes 0..95 around center 48.
+const COARSE_CENTER: i32 = 48;
+const COARSE_RANGE: i32 = 96;
+const COARSE_STEP: f32 = 0.2;
 /// joc_num_bands_idx 5 → 12 parameter bands.
-const ENC_BANDS_IDX: u32 = 5;
-const ENC_BANDS: usize = 12;
+pub const ENC_BANDS_IDX: u32 = 5;
+pub const ENC_BANDS: usize = 12;
+/// Largest magnitude the fine quantizer can represent (±9.5).
+pub const MAX_GAIN: f32 = 9.5;
+/// Diagonal loading relative to the per-band core covariance trace.
+const RIDGE: f64 = 3e-3;
 
 /// Symbol → (code, bit length), derived from a decode tree at startup.
 struct HuffEnc {
@@ -226,15 +234,34 @@ impl HuffEnc {
     }
 }
 
-fn fine_mtx_encoder() -> &'static HuffEnc {
+fn mtx_encoder(quant: u8) -> &'static HuffEnc {
     use std::sync::OnceLock;
-    static ENC: OnceLock<HuffEnc> = OnceLock::new();
-    ENC.get_or_init(|| HuffEnc::from_tree(&JOC_HUFF_CODE_FINE_GENERIC))
+    static FINE: OnceLock<HuffEnc> = OnceLock::new();
+    static COARSE: OnceLock<HuffEnc> = OnceLock::new();
+    if quant == 1 {
+        FINE.get_or_init(|| HuffEnc::from_tree(&JOC_HUFF_CODE_FINE_GENERIC))
+    } else {
+        COARSE.get_or_init(|| HuffEnc::from_tree(&JOC_HUFF_CODE_COARSE_GENERIC))
+    }
+}
+
+fn quant_params(quant: u8) -> (i32, i32, f32) {
+    if quant == 1 {
+        (FINE_CENTER, FINE_RANGE, FINE_STEP)
+    } else {
+        (COARSE_CENTER, COARSE_RANGE, COARSE_STEP)
+    }
 }
 
 /// Quantize a broadband mixing gain to a fine-quant code (0..191).
 pub fn quantize_gain(g: f32) -> i32 {
-    ((g / FINE_STEP).round() as i32 + FINE_CENTER).clamp(0, FINE_RANGE - 1)
+    let (center, range, step) = quant_params(1);
+    ((g / step).round() as i32 + center).clamp(0, range - 1)
+}
+
+fn quantize_gain_mode(g: f32, quant: u8) -> i32 {
+    let (center, range, step) = quant_params(quant);
+    ((g / step).round() as i32 + center).clamp(0, range - 1)
 }
 
 /// Dequantize back to the gain the decoder will apply (for self-verification).
@@ -242,14 +269,29 @@ pub fn dequantize_gain(q: i32) -> f32 {
     (q - FINE_CENTER) as f32 * FINE_STEP
 }
 
-/// Encode one JOC frame. `matrices[obj][ch]` = broadband mixing gain reconstructing dynamic
-/// object `obj` from core channel `ch` (order L, R, C, Ls, Rs — joc_dmx_config_idx 0; the LFE is
-/// bypassed and must not be included). All parameter bands carry the same broadband value, so the
-/// band-differential codes after the first band are zeros (1 bit each in the fine table).
-pub fn encode_joc(matrices: &[[f32; 5]], seq: u16) -> Vec<u8> {
+/// Encode one JOC frame. `matrices[obj][band][ch]` = mixing gain reconstructing dynamic object
+/// `obj` in parameter band `band` from core channel `ch` (order L, R, C, Ls, Rs —
+/// joc_dmx_config_idx 0; the LFE is bypassed and must not be included). Each channel's 12 band
+/// gains are band-differentially Huffman coded, so neighbouring bands share the first-band code
+/// only through the differential prediction, not by being forced equal.
+pub fn encode_joc(matrices: &[[[f32; 5]; ENC_BANDS]], seq: u16) -> Vec<u8> {
+    encode_joc_ex(matrices, seq, 1, true)
+}
+
+/// General JOC frame encoder. `quant=1` is fine (0.1 step), `quant=0` coarse (0.2 step).
+/// With `per_band=false`, every parameter band repeats the band-0 gain (the old broadband form),
+/// which is a useful low-bitrate fallback for frames whose per-band payload would not fit the
+/// E-AC-3 skip field.
+pub fn encode_joc_ex(
+    matrices: &[[[f32; 5]; ENC_BANDS]],
+    seq: u16,
+    quant: u8,
+    per_band: bool,
+) -> Vec<u8> {
     let nobj = matrices.len();
     assert!((1..=64).contains(&nobj), "JOC supports 1..=64 objects");
-    let enc = fine_mtx_encoder();
+    let (center, range, _) = quant_params(quant);
+    let enc = mtx_encoder(quant);
     let mut w = BitWriter::new();
     // joc_header()
     w.write(0, 3); // joc_dmx_config_idx = 0 (5.1 core: L R C Ls Rs + bypassed LFE)
@@ -263,57 +305,81 @@ pub fn encode_joc(matrices: &[[f32; 5]], seq: u16) -> Vec<u8> {
         w.bit(1); // b_joc_obj_present
         w.write(ENC_BANDS_IDX, 3);
         w.bit(0); // b_joc_sparse = 0 → full matrix
-        w.write(1, 1); // joc_quant_table_idx = fine
+        w.write(quant as u32, 1); // joc_quant_table_idx
         w.bit(0); // b_joc_slope (steep) = 0
         w.write(0, 1); // joc_num_data_points − 1 = 0
     }
     // joc_data()
     for m in matrices {
-        for &g in m.iter() {
-            let q = quantize_gain(g);
-            let v0 = (q - FINE_CENTER).rem_euclid(FINE_RANGE);
-            enc.put(&mut w, v0);
-            for _ in 1..ENC_BANDS {
-                enc.put(&mut w, 0);
+        for ch in 0..5 {
+            if per_band {
+                let mut prev = 0i32;
+                for band in 0..ENC_BANDS {
+                    let q = quantize_gain_mode(m[band][ch], quant);
+                    let code = if band == 0 {
+                        (q - center).rem_euclid(range)
+                    } else {
+                        (q - prev).rem_euclid(range)
+                    };
+                    enc.put(&mut w, code);
+                    prev = q;
+                }
+            } else {
+                let q = quantize_gain_mode(m[0][ch], quant);
+                enc.put(&mut w, (q - center).rem_euclid(range));
+                for _ in 1..ENC_BANDS {
+                    enc.put(&mut w, 0);
+                }
             }
         }
     }
     w.into_bytes()
 }
 
-/// Least-squares JOC analysis for one frame: given the downmix gains `d[obj][ch]`
-/// (core_ch = Σ_obj d[obj][ch]·s_obj, channel order L R C Ls Rs) and per-object signal powers
-/// `p[obj]` (mean square over the frame), return the reconstruction matrices `M[obj][ch]`
-/// minimizing E‖s_obj − Σ_ch M[obj][ch]·core_ch‖² for uncorrelated objects:
-/// M_obj = p_obj·d_obj·(Dᵀ·diag(p)·D + λI)⁻¹. Silent objects get all-zero rows.
-pub fn analyze_frame(d: &[[f32; 5]], p: &[f32]) -> Vec<[f32; 5]> {
-    assert_eq!(d.len(), p.len());
-    let mut c = [[0f64; 5]; 5];
-    for (row, &pw) in d.iter().zip(p) {
-        for i in 0..5 {
-            for j in 0..5 {
-                c[i][j] += pw as f64 * row[i] as f64 * row[j] as f64;
-            }
+/// Least-squares JOC analysis from real per-band signal statistics.
+///
+/// `core_cov[b]` is the 5×5 covariance of the core channels in parameter band `b`, and
+/// `cross[obj][b]` is the covariance of that band of the target object with the core channels.
+/// The optimal (Wiener) reconstruction for each band is `M_obj = R⁻¹·r_obj`, which minimises
+/// `E‖s_obj − Σ_ch M[obj][ch]·core_ch‖²` without assuming that the objects are uncorrelated.
+/// A small diagonal load (relative to the band's core energy) keeps quiet/ill-conditioned bands
+/// stable; rows that would exceed the fine quantizer's ±9.5 range are scaled rather than clipped.
+pub fn analyze_bands(
+    core_cov: &[[[f64; 5]; 5]; ENC_BANDS],
+    cross: &[[[f64; 5]; ENC_BANDS]],
+) -> Vec<[[f32; 5]; ENC_BANDS]> {
+    let mut inverses = [[[0f64; 5]; 5]; ENC_BANDS];
+    for b in 0..ENC_BANDS {
+        let mut c = core_cov[b];
+        let trace: f64 = (0..5).map(|i| c[i][i]).sum();
+        let ridge = trace * RIDGE / 5.0 + 1e-18;
+        for (i, row) in c.iter_mut().enumerate() {
+            row[i] += ridge;
         }
+        inverses[b] = invert5(&c);
     }
-    let trace: f64 = (0..5).map(|i| c[i][i]).sum();
-    let ridge = trace * 1e-3 / 5.0 + 1e-12;
-    for (i, row) in c.iter_mut().enumerate() {
-        row[i] += ridge;
-    }
-    let cinv = invert5(&c);
-    d.iter()
-        .zip(p)
-        .map(|(row, &pw)| {
-            let mut m = [0f32; 5];
-            for j in 0..5 {
-                let mut v = 0f64;
-                for i in 0..5 {
-                    v += pw as f64 * row[i] as f64 * cinv[i][j];
+    cross
+        .iter()
+        .map(|obj| {
+            let mut out = [[0f32; 5]; ENC_BANDS];
+            for b in 0..ENC_BANDS {
+                let mut m = [0f64; 5];
+                for j in 0..5 {
+                    for i in 0..5 {
+                        m[j] += obj[b][i] * inverses[b][i][j];
+                    }
                 }
-                m[j] = (v as f32).clamp(-9.5, 9.5);
+                let peak = m.iter().fold(0f64, |a, &v| a.max(v.abs()));
+                let scale = if peak > MAX_GAIN as f64 {
+                    MAX_GAIN as f64 / peak
+                } else {
+                    1.0
+                };
+                for (ch, v) in out[b].iter_mut().enumerate() {
+                    *v = (m[ch] * scale) as f32;
+                }
             }
-            m
+            out
         })
         .collect()
 }
@@ -355,56 +421,137 @@ mod tests {
 
     #[test]
     fn joc_roundtrip() {
-        let matrices = vec![
-            [1.0f32, 0.0, 0.0, 0.0, 0.0],
-            [0.0, -0.5, 0.7, 0.0, 0.2],
-            [0.3, 0.3, 0.0, 0.9, -9.5],
-        ];
+        // A deliberately band-dependent matrix set: with the old encoder only band 0's value
+        // survived (all others were differential zeros), so this catches both coding bugs.
+        let mut matrices = vec![[[0f32; 5]; ENC_BANDS]; 3];
+        for (obj, obj_mtx) in matrices.iter_mut().enumerate() {
+            for (band, row) in obj_mtx.iter_mut().enumerate() {
+                for (ch, v) in row.iter_mut().enumerate() {
+                    *v = (obj as f32 * 0.37 - 1.0 + band as f32 * 0.23 + ch as f32 * 0.41)
+                        .clamp(-MAX_GAIN, MAX_GAIN);
+                }
+            }
+        }
         let payload = encode_joc(&matrices, 123);
         let f = decode_joc(&payload).expect("decode");
         assert_eq!(f.object_count, 3);
         assert_eq!(f.channel_count, 5);
         assert_eq!(f.seq, 123);
         assert!(payload.len() * 8 - f.bits_used < 8, "padding only");
-        for (obj, want) in f.objects.iter().zip(&matrices) {
+        for (oi, (obj, want)) in f.objects.iter().zip(&matrices).enumerate() {
             assert!(obj.active && !obj.sparse && obj.quant == 1);
             assert_eq!(obj.bands, ENC_BANDS);
-            // Reverse the band-differential coding: all bands must carry the same broadband value.
             for ch in 0..5 {
                 let codes = &obj.matrix[0][ch];
                 let mut q = (FINE_CENTER + codes[0]).rem_euclid(FINE_RANGE);
-                for &v in &codes[1..] {
-                    let q2 = (q + v).rem_euclid(FINE_RANGE);
-                    assert_eq!(q2, q);
-                    q = q2;
+                for band in 0..ENC_BANDS {
+                    let got = dequantize_gain(q);
+                    assert!(
+                        (got - want[band][ch]).abs() <= FINE_STEP / 2.0 + 1e-6,
+                        "obj{oi} ch{ch} band{band}: {got} vs {}",
+                        want[band][ch]
+                    );
+                    if band + 1 < ENC_BANDS {
+                        q = (q + codes[band + 1]).rem_euclid(FINE_RANGE);
+                    }
                 }
-                let got = dequantize_gain(q);
-                assert!(
-                    (got - want[ch]).abs() <= FINE_STEP / 2.0 + 1e-6,
-                    "ch{ch}: {got} vs {}",
-                    want[ch]
-                );
             }
         }
     }
 
     #[test]
-    fn analysis_recovers_isolated_objects() {
-        // Three objects panned to distinct channels with distinct powers: the LS solution must
-        // reconstruct each object from its own channel with gain ≈ 1.
-        let d = vec![
-            [1.0f32, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.7, 0.7],
+    fn coarse_and_broadband_modes_roundtrip() {
+        let mut matrices = vec![[[0f32; 5]; ENC_BANDS]; 2];
+        for (obj, obj_mtx) in matrices.iter_mut().enumerate() {
+            for (band, row) in obj_mtx.iter_mut().enumerate() {
+                for (ch, v) in row.iter_mut().enumerate() {
+                    *v = (obj as f32 * 0.5 - 0.7 + band as f32 * 0.19 + ch as f32 * 0.33)
+                        .clamp(-MAX_GAIN, MAX_GAIN);
+                }
+            }
+        }
+        for quant in [0u8, 1] {
+            for per_band in [true, false] {
+                let (center, range, step) = quant_params(quant);
+                let payload = encode_joc_ex(&matrices, 7, quant, per_band);
+                let f = decode_joc(&payload).expect("decode");
+                for (oi, obj) in f.objects.iter().enumerate() {
+                    assert_eq!(obj.quant, quant);
+                    for ch in 0..5 {
+                        let codes = &obj.matrix[0][ch];
+                        let mut q = (center + codes[0]).rem_euclid(range);
+                        for band in 0..ENC_BANDS {
+                            let want = if per_band {
+                                matrices[oi][band][ch]
+                            } else {
+                                matrices[oi][0][ch]
+                            };
+                            let got = (q - center) as f32 * step;
+                            assert!(
+                                (got - want).abs() <= step / 2.0 + 1e-6,
+                                "quant {quant} per_band {per_band} obj {oi} ch {ch} band {band}: \
+                                 {got} vs {want}"
+                            );
+                            if band + 1 < ENC_BANDS {
+                                q = (q + codes[band + 1]).rem_euclid(range);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn band_analysis_recovers_isolated_objects() {
+        // Three objects panned to distinct channels with distinct powers. The per-band LS solution
+        // must reconstruct each object from its own channels with gain ≈ 1, in every band, even
+        // when the panning differs from band to band.
+        let pans = [
+            [
+                [1.0f32, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.7, 0.7],
+            ],
+            [
+                [0.7f32, 0.7, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.6, 0.8, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 1.0],
+            ],
         ];
-        let p = vec![1.0f32, 0.25, 0.5];
-        let m = analyze_frame(&d, &p);
-        assert!((m[0][0] - 1.0).abs() < 0.01, "{:?}", m[0]);
-        assert!((m[1][2] - 1.0).abs() < 0.01, "{:?}", m[1]);
-        assert!((m[2][3] - 0.714).abs() < 0.02, "{:?}", m[2]); // 0.7/(0.7²+0.7²)·0.7… ≈ 1/1.4
-        // A silent object must not grab channel content.
-        let m = analyze_frame(&d, &[1.0, 0.0, 1.0]);
-        assert!(m[1].iter().all(|&v| v.abs() < 1e-3), "{:?}", m[1]);
+        let powers = [1.0f64, 0.25, 0.5];
+        let mut cov = [[[0f64; 5]; 5]; ENC_BANDS];
+        let mut cross = vec![[[0f64; 5]; ENC_BANDS]; 3];
+        for b in 0..ENC_BANDS {
+            let d = &pans[b % pans.len()];
+            for (o, row) in d.iter().enumerate() {
+                for i in 0..5 {
+                    for j in 0..5 {
+                        cov[b][i][j] += powers[o] * row[i] as f64 * row[j] as f64;
+                    }
+                    cross[o][b][i] = powers[o] * row[i] as f64;
+                }
+            }
+        }
+        let m = analyze_bands(&cov, &cross);
+        for b in 0..ENC_BANDS {
+            let d = &pans[b % pans.len()];
+            for o in 0..3 {
+                let gain: f64 = (0..5).map(|ch| m[o][b][ch] as f64 * d[o][ch] as f64).sum();
+                assert!((gain - 1.0).abs() < 0.01, "band {b} obj {o}: gain {gain}");
+                for other in 0..3 {
+                    if other == o {
+                        continue;
+                    }
+                    let leak: f64 = (0..5)
+                        .map(|ch| m[o][b][ch] as f64 * d[other][ch] as f64)
+                        .sum();
+                    assert!(leak.abs() < 0.01, "band {b} obj {o} leaks {other}: {leak}");
+                }
+            }
+        }
+        // And the solution really is band-dependent.
+        assert!((0..5).any(|ch| (m[0][0][ch] - m[0][1][ch]).abs() > 0.1));
     }
 }
 

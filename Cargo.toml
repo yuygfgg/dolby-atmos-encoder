@@ -22,6 +22,8 @@ env_logger = "0.11"
 # Keyed-MAC stand-in for the EMDF protection seam (see src/emdf.rs::dolby_keyed_mac).
 hmac = "0.12"
 sha2 = "0.10"
+# FFT bank for the per-band JOC covariance analysis (src/joc_analysis.rs).
+rustfft = "6"
 
 # Empty [workspace] table: makes this package its own workspace root so it detaches cleanly from
 # the parent `truehdd` Cargo workspace it physically lives under. Without this, cargo refuses to

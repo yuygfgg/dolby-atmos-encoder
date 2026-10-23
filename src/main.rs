@@ -23,6 +23,7 @@ mod eac3;
 mod eac3_audblk;
 mod emdf;
 mod joc;
+mod joc_analysis;
 mod joc_tables;
 mod render;
 
@@ -522,6 +523,11 @@ fn jocprobe(input: &Path, detail_frame: usize) -> Result<()> {
     let mut emdf_found = 0usize;
     let mut joc_ok = 0usize;
     let mut joc_err: Vec<(usize, String)> = Vec::new();
+    let mut obj_active = [0usize; 64];
+    let mut obj_dp2 = [0usize; 64];
+    let mut obj_steep = [0usize; 64];
+    let mut obj_coarse = [0usize; 64];
+    let mut obj_sparse = [0usize; 64];
     let mut seqs: Vec<u16> = Vec::new();
 
     for (idx, f) in frames.iter().enumerate() {
@@ -548,6 +554,16 @@ fn jocprobe(input: &Path, detail_frame: usize) -> Result<()> {
             Ok(jf) => {
                 joc_ok += 1;
                 seqs.push(jf.seq);
+                for (o, obj) in jf.objects.iter().enumerate().take(64) {
+                    if !obj.active {
+                        continue;
+                    }
+                    obj_active[o] += 1;
+                    obj_dp2[o] += (obj.data_points == 2) as usize;
+                    obj_steep[o] += obj.steep_slope as usize;
+                    obj_coarse[o] += (obj.quant == 0) as usize;
+                    obj_sparse[o] += obj.sparse as usize;
+                }
                 if detail {
                     println!(
                         "\n  JOC: dmx_config={} ({}ch core), {} objects, gain={}*2^({}-4)/32+1, seq={}",
@@ -617,6 +633,13 @@ fn jocprobe(input: &Path, detail_frame: usize) -> Result<()> {
     for (idx, e) in &joc_err {
         println!("JOC decode error at frame {idx}: {e}");
     }
+    println!("per-object coding (active/dp2/steep/coarse/sparse):");
+    for o in 0..obj_active.iter().rposition(|&n| n > 0).map_or(0, |m| m + 1) {
+        println!(
+            "  obj {o:2}: {:5} / {:5} / {:5} / {:5} / {:5}",
+            obj_active[o], obj_dp2[o], obj_steep[o], obj_coarse[o], obj_sparse[o]
+        );
+    }
     Ok(())
 }
 
@@ -628,8 +651,8 @@ struct AtmosCtx {
     /// them). `frames[i]` lines up index-for-index with what `transform_frames_io` delivers.
     frames: Vec<eac3::FrameInfo>,
     start_samples: Vec<u64>,
-    /// Per core frame, per dynamic object: mean-square signal power from the CAF essence.
-    powers: Vec<Vec<f32>>,
+    /// Streaming per-band JOC analyser over the DAMF essence.
+    joc: joc_analysis::JocAnalyzer,
 }
 
 fn load_ctx(core: &Path, atmos: &Path) -> Result<AtmosCtx> {
@@ -680,80 +703,19 @@ fn load_ctx(core: &Path, atmos: &Path) -> Result<AtmosCtx> {
         }
     }
 
-    // Per-frame per-object mean-square power from the CAF essence (object i = channel 1+i,
-    // after the single LFE bed channel), binned to the core's frame grid for the JOC analysis.
-    let caf_path = dir.join(&pres.audio);
-    let caf = damf::read_caf_info(&caf_path)?;
-    anyhow::ensure!(
-        caf.bits_per_channel == 24 && !caf.is_float(),
-        "expected 24-bit int CAF essence"
-    );
-    let channels = caf.channels as usize;
-    anyhow::ensure!(
-        channels >= 1 + nobj,
-        "CAF has {channels} channels, need {}",
-        1 + nobj
-    );
-    let mut powers = vec![vec![0f32; nobj]; frames.len()];
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut rdr = std::io::BufReader::new(std::fs::File::open(&caf_path)?);
-        rdr.seek(SeekFrom::Start(caf.data_offset))?;
-        let block = 8192usize;
-        let mut buf = vec![0u8; block * channels * 3];
-        let mut t: u64 = 0;
-        let mut fi = 0usize;
-        let mut remaining = caf.frames();
-        'outer: while remaining > 0 {
-            let this = remaining.min(block as u64) as usize;
-            rdr.read_exact(&mut buf[..this * channels * 3])
-                .with_context(|| format!("reading essence at sample {t}"))?;
-            for s in 0..this {
-                while fi + 1 < frames.len() && t >= start_samples[fi + 1] {
-                    fi += 1;
-                }
-                if t >= start_samples[fi] + frames[fi].samples() as u64 {
-                    break 'outer; // essence runs past the last core frame
-                }
-                let base = s * channels * 3;
-                for o in 0..nobj {
-                    let off = base + (1 + o) * 3;
-                    let v = render::s24be(&buf[off..off + 3]);
-                    powers[fi][o] += v * v;
-                }
-                t += 1;
-            }
-            remaining -= this as u64;
-        }
-        for (i, f) in frames.iter().enumerate() {
-            let n = f.samples() as f32;
-            for v in powers[i].iter_mut() {
-                *v /= n;
-            }
-        }
-    }
+    // Per-band JOC statistics are computed from the essence while the core streams through the
+    // injector, so no per-frame covariance table is ever stored (memory stays O(frames) for the
+    // header grid only).
+    let joc = joc_analysis::JocAnalyzer::new(&dir.join(&pres.audio), dir, pres)
+        .context("setting up per-band JOC analysis")?;
 
     Ok(AtmosCtx {
         timelines,
         nobj,
         frames,
         start_samples,
-        powers,
+        joc,
     })
-}
-
-/// Per-object 5.1-mains downmix gains at the frame midpoint — the same VBAP pan the `downmix`
-/// renderer applied, so the JOC analysis models the core it will reconstruct from.
-fn frame_downmix_gains(ctx: &AtmosCtx, i: usize) -> Vec<[f32; 5]> {
-    let f = &ctx.frames[i];
-    let t = ctx.start_samples[i] + f.samples() as u64 / 2;
-    ctx.timelines
-        .iter()
-        .map(|tl| {
-            let p = tl.at(t);
-            render::pan_vbap(p[0] as f64, p[1] as f64)
-        })
-        .collect()
 }
 
 /// Sample the per-frame object positions (ramp target = frame end) for frame `i`.
@@ -774,15 +736,16 @@ fn frame_objects(ctx: &AtmosCtx, i: usize) -> Vec<emdf::ObjectPos> {
 }
 
 fn atmos_inject(core: &Path, atmos: &Path, out: &Path) -> Result<()> {
-    let ctx = load_ctx(core, atmos)?;
+    let mut ctx = load_ctx(core, atmos)?;
     let object_count = ctx.nobj + 1; // + LFE bed
     let complexity = object_count.min(16) as u8;
     // addbsi §8.3: reserved(7)=0 · flag_ec3_extension_type_a(1)=1 · complexity_index_type_a(8).
     let addbsi = [0x01u8, complexity];
 
-    // Stream the core through transform_frames_io: only a bounded window is ever held, never the
-    // whole core. Frame `i` lines up with ctx.frames[i] / ctx.powers[i] because parse_frames_io (the
-    // grid builder) and transform_frames_io walk frames identically. Inject + self-verify inline.
+    // Stream the core through the fallible transform: only a bounded window is ever held, never
+    // the whole core. Frame `i` lines up with ctx.frames[i] because parse_frames_io (the grid
+    // builder) and transform_frames_io walk frames identically. The per-band JOC analyser advances
+    // through the essence in lockstep and produces this frame's matrices just before injection.
     let reader = std::io::BufReader::new(
         std::fs::File::open(core).with_context(|| format!("reading {}", core.display()))?,
     );
@@ -791,31 +754,69 @@ fn atmos_inject(core: &Path, atmos: &Path, out: &Path) -> Result<()> {
     );
     let mut emdf_bytes = 0usize;
     let mut skipfield_frames = 0usize;
+    let mut max_emdf = 0usize;
+    let mut coarse_frames = 0usize;
+    let mut broadband_frames = 0usize;
+    let mut aux_frames = 0usize;
     let (mut flag_ok, mut oamd_ok, mut joc_ok) = (0usize, 0usize, 0usize);
-    let processed = eac3::transform_frames_io(reader, writer, |f, i, frame| {
+    let processed = eac3::transform_frames_io_try(reader, writer, |f, i, frame| {
         let objs = frame_objects(&ctx, i);
         let oamd = emdf::encode_oamd(&objs, true);
-        let dmx = frame_downmix_gains(&ctx, i);
-        let mtx = joc::analyze_frame(&dmx, &ctx.powers[i]);
-        let jocp = joc::encode_joc(&mtx, (i % 1024) as u16);
+        let start = ctx.start_samples[i];
+        let end = start + f.samples() as u64;
+        let mtx = ctx.joc.matrices_for_frame(start, end).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("JOC band analysis at frame {i}: {e}"))
+        })?;
         // Real Dolby DD+ JOC streams carry two small constant companion payloads after JOC
         // (id 2 = [04 94 80], id 1 = [02 00]); a decoder may require these to treat the stream as
         // object audio. Match the working EAC3-JOC ATMOS file's order: OAMD(11), JOC(14), 2, 1.
-        let payload = emdf::wrap_emdf(&[
-            (emdf::PAYLOAD_OAMD, oamd),
-            (emdf::PAYLOAD_JOC, jocp),
-            (2, vec![0x04, 0x94, 0x80]),
-            (1, vec![0x02, 0x00]),
-        ]);
+        let make_payload = |jocp: Vec<u8>| {
+            emdf::wrap_emdf(&[
+                (emdf::PAYLOAD_OAMD, oamd.clone()),
+                (emdf::PAYLOAD_JOC, jocp),
+                (2, vec![0x04, 0x94, 0x80]),
+                (1, vec![0x02, 0x00]),
+            ])
+        };
+        let seq = (i % 1024) as u16;
+        // The skip field's 9-bit skipl can carry at most 511 bytes. Prefer full 12-band fine
+        // matrices; a handful of transient-heavy frames would overflow, so fall back to coarse
+        // quantization first, then to the broadband form (all bands equal) for those frames only.
+        let mut chosen: Option<(Vec<u8>, u8)> = None; // (EMDF, mode)
+        for (quant, per_band, mode) in [(1, true, 0u8), (0, true, 1), (1, false, 2), (0, false, 3)]
+        {
+            let p = make_payload(joc::encode_joc_ex(mtx, seq, quant, per_band));
+            let fits = p.len() <= 511;
+            if chosen
+                .as_ref()
+                .is_none_or(|(best, _)| fits || p.len() < best.len())
+            {
+                chosen = Some((p, mode));
+            }
+            if fits {
+                break;
+            }
+        }
+        let (payload, mode) = chosen.expect("at least one JOC encoding attempt");
+        match mode {
+            1 => coarse_frames += 1,
+            2 | 3 => broadband_frames += 1,
+            _ => {}
+        }
         emdf_bytes += payload.len();
+        max_emdf = max_emdf.max(payload.len());
         // Prefer real Dolby-style carriage: EMDF in an audio-block skip field (mid-frame). Fall
-        // back to tail auxdata if a frame's audio blocks are outside the walker's supported subset.
+        // back to tail auxdata if a frame's audio blocks are outside the walker's supported subset
+        // or the payload exceeds the 9-bit skipl limit.
         let injected = match eac3::inject_frame_skipfield(frame, f, &addbsi, &payload, 2) {
             Some(out) => {
                 skipfield_frames += 1;
                 out
             }
-            None => eac3::inject_frame_full(frame, f, &addbsi, &payload, payload.len() * 8),
+            None => {
+                aux_frames += 1;
+                eac3::inject_frame_full(frame, f, &addbsi, &payload, payload.len() * 8)
+            }
         };
         // Self-verify this frame: read the addbsi flag, OAMD and JOC back. The EMDF is bit-scanned
         // anywhere in the frame (skip-field carriage is not byte-aligned).
@@ -845,12 +846,15 @@ fn atmos_inject(core: &Path, atmos: &Path, out: &Path) -> Result<()> {
                 }
             }
         }
-        injected
+        Ok(injected)
     })
     .with_context(|| format!("streaming {} -> {}", core.display(), out.display()))?;
 
     let nframes = ctx.frames.len();
-    debug_assert_eq!(processed, nframes, "streamed frame count must match the grid");
+    debug_assert_eq!(
+        processed, nframes,
+        "streamed frame count must match the grid"
+    );
     let checked = nframes;
     let in_sz = std::fs::metadata(core)?.len();
     let out_sz = std::fs::metadata(out)?.len();
@@ -863,8 +867,8 @@ fn atmos_inject(core: &Path, atmos: &Path, out: &Path) -> Result<()> {
         nframes
     );
     println!(
-        "  carriage: skip-field {}/{} frames (rest fell back to auxdata)",
-        skipfield_frames, nframes
+        "  carriage: skip-field {}/{} frames, max EMDF {max_emdf} B, coarse frames {coarse_frames}, broadband frames {broadband_frames}, aux fallback {}",
+        skipfield_frames, nframes, aux_frames
     );
     println!(
         "  size {} -> {} B (+{} B, +{:.1}%)",

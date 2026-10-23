@@ -29,8 +29,11 @@ A near-complete reimplementation of the relevant parts of a DD+ Atmos encoder, i
 - **5.1 downmix renderer** — VBAP-pans the Atmos objects to a 5.1 bed (L R C LFE Ls Rs).
 - **OAMD encoder** (ETSI TS 103 420) — per-frame Object Audio Metadata: object positions (with
   elevation), bed/LFE, program assignment. Round-trips through our decoder and Cavern.
-- **JOC encoder** — Joint Object Coding matrices over the 5-channel core × parameter bands, with
-  Dolby's quant/Huffman config. Bit-exact round-trip.
+- **JOC encoder** — Joint Object Coding matrices over the 5-channel core × 12 parameter bands.
+  Per-band matrices are estimated from the real core/object covariance (Wiener least squares) rather
+  than reusing one broadband pan gain in every band, then band-differentially quantized with Dolby's
+  fine/coarse Huffman tables. Frames whose payload would exceed the 9-bit skip-field limit fall back
+  to coarse (then broadband) matrices for that frame only. Bit-exact round-trip.
 - **EMDF container** (ETSI TS 102 366 Annex H) — wraps OAMD (id 11) + JOC (id 14) with the
   `emdf_protection` field, carried in the E-AC-3 audio-block **skip field** exactly where real Dolby
   streams put it (recomputing `frmsiz` + `crc2`).
@@ -48,8 +51,8 @@ cargo build --release
 ```
 
 (Stand-alone crate — it does **not** depend on the `truehdd` library; it consumes the DAMF files
-`truehdd` produces. The only out-of-the-ordinary deps are `hmac`/`sha2`, used by the EMDF signing
-seam.)
+`truehdd` produces. The only codec-specific dependency is `rustfft`, used by the per-band JOC
+analysis; `hmac`/`sha2` implement the EMDF signing seam.)
 
 ### Memory use (large files)
 
@@ -167,10 +170,15 @@ Run end-to-end on a full feature film — a *Logan* (2017) 2160p UHD Blu-ray rem
 |---|---|
 | `truehdd decode` | 9,891,890 TrueHD frames → 395,675,600 samples (full 137 min), 16 GB DAMF essence |
 | `downmix --out -` → ffmpeg | 791 MB E-AC-3 core @ 768 kbps (raw-pipe path; no WAV size cap hit) |
-| `atmos` inject | 257,602 E-AC-3 frames; **13 dynamic objects + LFE**; JOC avg 213 B EMDF/frame |
+| `atmos` inject | 257,602 E-AC-3 frames; **13 dynamic objects + LFE**; 12-band JOC matrices |
 | Carriage | skip-field on **257,602 / 257,602** frames (100%); addbsi detection flag on all |
 | Output | 809 MB `atmos.eac3` |
 | **Cavern** | `HasObjects=True`, **13 objects**, 1 bed instance, 5-channel JOC downmix |
+
+> The table above was measured with the earlier broadband JOC analysis. The per-band analysis
+> improves object reconstruction substantially (on the 16-channel test master: mean object
+> correlation vs the DAMF master rose from 0.836 to 0.963) at the cost of a larger JOC payload,
+> so the Logan output size would grow accordingly.
 
 **Memory is bounded by frame count, not file size.** Every subcommand streams the core through
 `eac3::transform_frames_io` (~4 MiB rolling buffer), so the working set is fixed regardless of length:
@@ -179,8 +187,8 @@ that same 791 MB Logan core runs `eac3inject` at **7.9 MB peak RSS** (a 1.25 GB 
 (`eac3::parse_frames_io`) of the core plus a streaming pass over the CAF essence — both *O(number of
 frames)*, never the core bytes — then streams the input core and output through the same path. So it
 no longer holds the core in RAM: an earlier build peaked at **815 MB** on Logan (it loaded the whole
-core); it now stays in the tens of MB (≈ the 7.9 MB streaming floor plus the per-frame position/power
-tables). Output is byte-identical across this refactor (golden SHA-256 verified).
+core); it now stays in the tens of MB (≈ the 7.9 MB streaming floor plus the per-frame position
+tables and the streaming per-band analyser's fixed-size FFT/statistics buffers).
 
 > These are *decoder-side* results: ffmpeg and Cavern both accept the stream as object Atmos. It
 > still will **not** engage Atmos on Dolby-certified hardware — see below for why.
@@ -271,7 +279,8 @@ src/
   damf.rs          DAMF (.atmos/.audio/.metadata) reader
   render.rs        Atmos objects -> 5.1 bed (VBAP)
   emdf.rs          EMDF container, OAMD encode/decode, the EmdfProtector signing seam
-  joc.rs           Joint Object Coding analysis + payload writer
+  joc.rs           Joint Object Coding matrix solve + payload writer
+  joc_analysis.rs  Streaming per-band covariance analysis (rustfft bank over the DAMF essence)
   joc_tables.rs    JOC quant / Huffman tables
   eac3.rs          E-AC-3 frame parse, BSI, aux/skip-field injection, crc2
   eac3_audblk.rs   A/52 audio-block bit-walker (locates the skip field)

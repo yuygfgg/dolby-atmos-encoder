@@ -60,15 +60,18 @@ pub(crate) fn s24be(b: &[u8]) -> f32 {
 }
 
 /// One object's panning timeline: essence channel + (samplePos, gains) keyframes.
-struct ObjEnv {
-    ess_ch: usize,
-    keys: Vec<(u64, [f32; 5])>,
-    cursor: usize,
+pub(crate) struct ObjEnv {
+    pub(crate) ess_ch: usize,
+    pub(crate) keys: Vec<(u64, [f32; 5])>,
+    pub(crate) cursor: usize,
 }
 
 impl ObjEnv {
     /// Gains at absolute sample index `t`, advancing the cursor (t is monotonically increasing).
-    fn gains_at(&mut self, t: u64) -> [f32; 5] {
+    pub(crate) fn gains_at(&mut self, t: u64) -> [f32; 5] {
+        if self.keys.is_empty() {
+            return [0.0; 5];
+        }
         while self.cursor + 1 < self.keys.len() && self.keys[self.cursor + 1].0 <= t {
             self.cursor += 1;
         }
@@ -89,6 +92,32 @@ impl ObjEnv {
             g0
         }
     }
+}
+
+/// Build each element's per-sample panning gain keyframes from the diff-encoded metadata events.
+pub(crate) fn gain_keyframes(meta: &damf::Metadata) -> HashMap<u32, Vec<(u64, [f32; 5])>> {
+    let mut cur: HashMap<u32, ([f64; 3], bool)> = HashMap::new();
+    let mut keys: HashMap<u32, Vec<(u64, [f32; 5])>> = HashMap::new();
+    for e in &meta.events {
+        let Some(id) = e.id else { continue };
+        let sp = e.sample_pos.unwrap_or(0);
+        let st = cur.entry(id).or_insert(([0.0, 0.0, 0.0], true));
+        if let Some(p) = &e.pos {
+            if p.len() == 3 {
+                st.0 = [p[0], p[1], p[2]];
+            }
+        }
+        if let Some(a) = e.active {
+            st.1 = a;
+        }
+        let g = if st.1 {
+            pan_vbap(st.0[0], st.0[1])
+        } else {
+            [0.0; 5]
+        };
+        keys.entry(id).or_default().push((sp, g));
+    }
+    keys
 }
 
 pub fn downmix(atmos: &Path, out: &Path, gain_db: f64) -> Result<()> {
@@ -126,27 +155,7 @@ pub fn downmix(atmos: &Path, out: &Path, gain_db: f64) -> Result<()> {
 
     // Build per-object gain keyframes from the (diff-encoded) metadata events.
     let meta = damf::Metadata::load(&dir.join(&pres.metadata))?;
-    let mut cur: HashMap<u32, ([f64; 3], bool)> = HashMap::new();
-    let mut keys: HashMap<u32, Vec<(u64, [f32; 5])>> = HashMap::new();
-    for e in &meta.events {
-        let Some(id) = e.id else { continue };
-        let sp = e.sample_pos.unwrap_or(0);
-        let st = cur.entry(id).or_insert(([0.0, 0.0, 0.0], true));
-        if let Some(p) = &e.pos {
-            if p.len() == 3 {
-                st.0 = [p[0], p[1], p[2]];
-            }
-        }
-        if let Some(a) = e.active {
-            st.1 = a;
-        }
-        let g = if st.1 {
-            pan_vbap(st.0[0], st.0[1])
-        } else {
-            [0.0; 5]
-        };
-        keys.entry(id).or_default().push((sp, g));
-    }
+    let keys = gain_keyframes(&meta);
 
     // Objects to render = every element that has a position timeline (i.e. not the LFE bed).
     let mut objects: Vec<ObjEnv> = Vec::new();
