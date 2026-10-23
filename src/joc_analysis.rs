@@ -152,7 +152,12 @@ pub(crate) struct JocAnalyzer {
 }
 
 impl JocAnalyzer {
-    pub(crate) fn new(caf_path: &Path, dir: &Path, pres: &damf::Presentation) -> Result<Self> {
+    pub(crate) fn new(
+        caf_path: &Path,
+        dir: &Path,
+        pres: &damf::Presentation,
+        pan_mode: render::PanMode,
+    ) -> Result<Self> {
         let caf = damf::read_caf_info(caf_path)?;
         ensure!(
             caf.bits_per_channel == 24 && !caf.is_float(),
@@ -168,7 +173,7 @@ impl JocAnalyzer {
         );
 
         let meta = damf::Metadata::load(&dir.join(&pres.metadata))?;
-        let mut keys = render::gain_keyframes(&meta);
+        let mut keys = render::gain_keyframes(&meta, pan_mode);
         let objects = pres
             .objects
             .iter()

@@ -69,6 +69,9 @@ enum Command {
         /// Makeup gain applied to the 5 main channels, in dB.
         #[arg(long, default_value_t = 0.0)]
         gain_db: f64,
+        /// Downmix panning law: `hard` (DME-style nearest-speaker + height trim) or `vbap`.
+        #[arg(long, value_enum, default_value = "hard")]
+        pan: render::PanMode,
     },
     /// Parse a raw E-AC-3 (.eac3/.ec3) elementary stream and report its syncframe structure.
     Eac3probe {
@@ -110,6 +113,9 @@ enum Command {
         /// Output E-AC-3 path.
         #[arg(short, long, default_value = "atmos.eac3")]
         out: PathBuf,
+        /// Downmix panning law used for JOC analysis (must match the `downmix` run).
+        #[arg(long, value_enum, default_value = "hard")]
+        pan: render::PanMode,
     },
     /// Find + decode the JOC payload in a real DD+ Atmos stream (EMDF at any bit offset, e.g.
     /// skip-field carriage). Dumps one frame in detail, then aggregate stats over all frames.
@@ -403,11 +409,17 @@ fn main() -> Result<()> {
             atmos,
             out,
             gain_db,
-        } => render::downmix(&atmos, &out, gain_db),
+            pan,
+        } => render::downmix(&atmos, &out, gain_db, pan),
         Command::Eac3probe { input } => eac3probe(&input),
         Command::Eac3inject { input, out, marker } => eac3inject(&input, &out, &marker),
         Command::Oamd { core, atmos, out } => oamd_inject(&core, &atmos, &out),
-        Command::Atmos { core, atmos, out } => atmos_inject(&core, &atmos, &out),
+        Command::Atmos {
+            core,
+            atmos,
+            out,
+            pan,
+        } => atmos_inject(&core, &atmos, &out, pan),
         Command::Jocprobe { input, frame } => jocprobe(&input, frame),
         Command::Walkprobe { input } => walkprobe(&input),
         Command::Graft {
@@ -655,7 +667,7 @@ struct AtmosCtx {
     joc: joc_analysis::JocAnalyzer,
 }
 
-fn load_ctx(core: &Path, atmos: &Path) -> Result<AtmosCtx> {
+fn load_ctx(core: &Path, atmos: &Path, pan: render::PanMode) -> Result<AtmosCtx> {
     let manifest = damf::Manifest::load(atmos)?;
     let dir = atmos.parent().unwrap_or_else(|| Path::new("."));
     let pres = manifest
@@ -706,7 +718,7 @@ fn load_ctx(core: &Path, atmos: &Path) -> Result<AtmosCtx> {
     // Per-band JOC statistics are computed from the essence while the core streams through the
     // injector, so no per-frame covariance table is ever stored (memory stays O(frames) for the
     // header grid only).
-    let joc = joc_analysis::JocAnalyzer::new(&dir.join(&pres.audio), dir, pres)
+    let joc = joc_analysis::JocAnalyzer::new(&dir.join(&pres.audio), dir, pres, pan)
         .context("setting up per-band JOC analysis")?;
 
     Ok(AtmosCtx {
@@ -735,8 +747,8 @@ fn frame_objects(ctx: &AtmosCtx, i: usize) -> Vec<emdf::ObjectPos> {
         .collect()
 }
 
-fn atmos_inject(core: &Path, atmos: &Path, out: &Path) -> Result<()> {
-    let mut ctx = load_ctx(core, atmos)?;
+fn atmos_inject(core: &Path, atmos: &Path, out: &Path, pan: render::PanMode) -> Result<()> {
+    let mut ctx = load_ctx(core, atmos, pan)?;
     let object_count = ctx.nobj + 1; // + LFE bed
     let complexity = object_count.min(16) as u8;
     // addbsi §8.3: reserved(7)=0 · flag_ec3_extension_type_a(1)=1 · complexity_index_type_a(8).

@@ -26,6 +26,58 @@ const RING: [(f64, usize); 5] = [
     (110.0, 4),  // Rs
 ];
 
+/// Downmix panning law. `Vbap` is the original constant-power pairwise spread; `Hard` mimics
+/// DME's static-object downmix: nearest 5.1 speaker, with a height trim (front −3 dB, surround
+/// −0.5 dB) and an Ls/Rs tie at the rear centre.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum PanMode {
+    Vbap,
+    Hard,
+}
+
+const FRONT_HEIGHT_TRIM: f32 = 0.707_945_8; // -3.0 dB
+const SURROUND_HEIGHT_TRIM: f32 = 0.944_060_9; // -0.5 dB
+
+/// Nearest speaker on the 5.1 ring, measured by absolute angular distance.
+fn nearest_speaker(az: f64) -> usize {
+    let mut best = 2;
+    let mut best_d = f64::INFINITY;
+    for (a, idx) in RING {
+        let mut d = (az - a).abs() % 360.0;
+        if d > 180.0 {
+            d = 360.0 - d;
+        }
+        if d < best_d {
+            best_d = d;
+            best = idx;
+        }
+    }
+    best
+}
+
+/// DME-style hard pan: one core speaker per object, except the rear-centre tie (Ls+Rs).
+pub(crate) fn pan_hard(x: f64, y: f64, z: f64) -> [f32; 5] {
+    let mut g = [0.0f32; 5];
+    if x.abs() < 1e-9 && y <= 0.0 {
+        g[3] = std::f32::consts::FRAC_1_SQRT_2;
+        g[4] = std::f32::consts::FRAC_1_SQRT_2;
+    } else {
+        let az = x.atan2(y).to_degrees();
+        g[nearest_speaker(az)] = 1.0;
+    }
+    if z > 0.0 {
+        let trim = if g[0] != 0.0 || g[1] != 0.0 || g[2] != 0.0 {
+            FRONT_HEIGHT_TRIM
+        } else {
+            SURROUND_HEIGHT_TRIM
+        };
+        for v in &mut g {
+            *v *= trim;
+        }
+    }
+    g
+}
+
 /// Constant-power pairwise pan of an object at room position (x,y) to `[L,R,C,Ls,Rs]` gains.
 pub(crate) fn pan_vbap(x: f64, y: f64) -> [f32; 5] {
     let mut g = [0.0f32; 5];
@@ -95,7 +147,10 @@ impl ObjEnv {
 }
 
 /// Build each element's per-sample panning gain keyframes from the diff-encoded metadata events.
-pub(crate) fn gain_keyframes(meta: &damf::Metadata) -> HashMap<u32, Vec<(u64, [f32; 5])>> {
+pub(crate) fn gain_keyframes(
+    meta: &damf::Metadata,
+    mode: PanMode,
+) -> HashMap<u32, Vec<(u64, [f32; 5])>> {
     let mut cur: HashMap<u32, ([f64; 3], bool)> = HashMap::new();
     let mut keys: HashMap<u32, Vec<(u64, [f32; 5])>> = HashMap::new();
     for e in &meta.events {
@@ -111,7 +166,10 @@ pub(crate) fn gain_keyframes(meta: &damf::Metadata) -> HashMap<u32, Vec<(u64, [f
             st.1 = a;
         }
         let g = if st.1 {
-            pan_vbap(st.0[0], st.0[1])
+            match mode {
+                PanMode::Vbap => pan_vbap(st.0[0], st.0[1]),
+                PanMode::Hard => pan_hard(st.0[0], st.0[1], st.0[2]),
+            }
         } else {
             [0.0; 5]
         };
@@ -120,7 +178,7 @@ pub(crate) fn gain_keyframes(meta: &damf::Metadata) -> HashMap<u32, Vec<(u64, [f
     keys
 }
 
-pub fn downmix(atmos: &Path, out: &Path, gain_db: f64) -> Result<()> {
+pub fn downmix(atmos: &Path, out: &Path, gain_db: f64, mode: PanMode) -> Result<()> {
     let manifest = damf::Manifest::load(atmos)?;
     let dir = atmos.parent().unwrap_or_else(|| Path::new("."));
     let pres = manifest
@@ -155,7 +213,7 @@ pub fn downmix(atmos: &Path, out: &Path, gain_db: f64) -> Result<()> {
 
     // Build per-object gain keyframes from the (diff-encoded) metadata events.
     let meta = damf::Metadata::load(&dir.join(&pres.metadata))?;
-    let keys = gain_keyframes(&meta);
+    let keys = gain_keyframes(&meta, mode);
 
     // Objects to render = every element that has a position timeline (i.e. not the LFE bed).
     let mut objects: Vec<ObjEnv> = Vec::new();
@@ -313,4 +371,61 @@ fn write_wav_header<W: Write>(
     w.write_all(b"data")?;
     w.write_all(&(data_size as u32).to_le_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn hard_pan_front_left_is_l_only() {
+        let g = pan_hard(-1.0, 1.0, 0.0);
+        assert!(approx(g[0], 1.0));
+        for k in [1, 2, 3, 4] {
+            assert!(approx(g[k], 0.0));
+        }
+    }
+
+    #[test]
+    fn hard_pan_front_centre_is_c_only() {
+        let g = pan_hard(0.0, 1.0, 0.0);
+        assert!(approx(g[2], 1.0));
+        for k in [0, 1, 3, 4] {
+            assert!(approx(g[k], 0.0));
+        }
+    }
+
+    #[test]
+    fn hard_pan_side_and_back_fold_to_surrounds() {
+        assert!(approx(pan_hard(-1.0, 0.0, 0.0)[3], 1.0));
+        assert!(approx(pan_hard(1.0, 0.0, 0.0)[4], 1.0));
+        assert!(approx(pan_hard(-1.0, -1.0, 0.0)[3], 1.0));
+    }
+
+    #[test]
+    fn hard_pan_rear_centre_ties_ls_rs() {
+        let g = pan_hard(0.0, 0.0, 0.0);
+        assert!(approx(g[3], std::f32::consts::FRAC_1_SQRT_2));
+        assert!(approx(g[4], std::f32::consts::FRAC_1_SQRT_2));
+    }
+
+    #[test]
+    fn hard_pan_height_trims() {
+        assert!(approx(pan_hard(-1.0, 1.0, 1.0)[0], FRONT_HEIGHT_TRIM));
+        assert!(approx(pan_hard(0.0, 1.0, 1.0)[2], FRONT_HEIGHT_TRIM));
+        assert!(approx(pan_hard(-1.0, 0.0, 1.0)[3], SURROUND_HEIGHT_TRIM));
+        let g = pan_hard(0.0, 0.0, 1.0);
+        assert!(approx(
+            g[3],
+            std::f32::consts::FRAC_1_SQRT_2 * SURROUND_HEIGHT_TRIM
+        ));
+        assert!(approx(
+            g[4],
+            std::f32::consts::FRAC_1_SQRT_2 * SURROUND_HEIGHT_TRIM
+        ));
+    }
 }
