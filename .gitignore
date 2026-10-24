@@ -4,3 +4,5 @@
 # .NET build output (tools/cavernprobe)
 **/bin/
 **/obj/
+
+.DS_Store
