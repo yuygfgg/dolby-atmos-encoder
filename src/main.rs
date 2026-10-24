@@ -937,14 +937,16 @@ fn atmos_inject(
             })?
             .to_vec();
         let rates = ctx.joc.object_rates().to_vec();
-        // Real Dolby DD+ JOC streams carry two small constant companion payloads after JOC
-        // (id 2 = [04 94 80], id 1 = [02 00]); a decoder may require these to treat the stream as
-        // object audio. Match the working EAC3-JOC ATMOS file's order: OAMD(11), JOC(14), 2, 1.
+        // Real Dolby DD+ JOC streams carry two small companion payloads after JOC:
+        // programme information (id 2, H.3.2) and programme loudness (id 1, H.3.1). The
+        // programme information must describe the actual preprocessing: `ph90filt` is set when
+        // the +90° Ls/Rs all-pass was applied to the core. Order: OAMD(11), JOC(14), 2, 1.
+        let program_info = emdf::encode_program_info(surround_phase_shift, 4, 4);
         let make_payload = |jocp: Vec<u8>| {
             emdf::wrap_emdf(&[
                 (emdf::PAYLOAD_OAMD, oamd.clone()),
                 (emdf::PAYLOAD_JOC, jocp),
-                (2, vec![0x04, 0x94, 0x80]),
+                (2, program_info.clone()),
                 (1, vec![0x02, 0x00]),
             ])
         };
@@ -1380,6 +1382,11 @@ fn build_timelines(pres: &damf::Presentation, dir: &Path) -> Result<Vec<PosTimel
     let mut keys: BTreeMap<u32, Vec<PosKey>> = BTreeMap::new();
     for e in &meta.events {
         let Some(id) = e.id else { continue };
+        anyhow::ensure!(
+            e.trim_bypass != Some(true),
+            "DAMF element {id} sets trimBypass=true, but the OAMD trim_element encoder only \
+             emits b_disable_trim_per_obj=0; implement the per-object array before encoding it"
+        );
         let sample = e.sample_pos.unwrap_or(0);
         if let Some(p) = &e.pos {
             if p.len() == 3 {

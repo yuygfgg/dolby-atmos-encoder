@@ -216,17 +216,35 @@ pub fn encode_oamd(objects: &[ObjectPos], lfe: bool) -> Vec<u8> {
     w.bit(1); // b_dyn_object_only_program
     w.bit(if lfe { 1 } else { 0 }); // b_lfe_present
     w.bit(0); // b_alternate_object_data_present
-    w.write(1, 4); // oa_element_count_bits = 1 element
+    w.write(2, 4); // oa_element_count_bits: object_element + trim_element
 
     // oa_element_md()
     w.write(1, 4); // oa_element_id_idx = 1 (object element)
-    // oa_element_size_bits = variable_bits_max(4,4) = (element body bits) - 1.
     let body = encode_object_element(objects, bed_count, object_count);
-    let size_value = (body.bit_len - 1) as u32;
+    // TS 103 420 §5.6.4.3: oa_element_size is the total length in BYTES of
+    // b_discard_unknown_element + oa_element + padding (no alternate id here).
+    let element_bits = 1 + body.bit_len;
+    let element_bytes = element_bits.div_ceil(8);
+    let size_value = (element_bytes - 1) as u32;
     write_var_max4(&mut w, size_value);
     // (b_alternate_object_data_present == 0 → no alternate id)
     w.bit(0); // b_discard_unknown_element
     w.copy_bits(&body.bytes, body.bit_len); // oa_element() = object_element()
+    for _ in 0..(element_bytes * 8 - element_bits) {
+        w.bit(0); // padding, counted by oa_element_size
+    }
+
+    // DME appends a trim_element on every frame. The values are the Dolby encoder's defaults for
+    // this master: warp_mode=1 (Y x2), default global trim, and no per-object disable because
+    // every DAMF element has trimBypass=false. build_timelines() rejects trimBypass=true until
+    // the per-object b_disable_trim array is implemented.
+    w.write(2, 4); // oa_element_id_idx = 2 (trim_element)
+    write_var_max4(&mut w, 0); // oa_element_size = 1 byte
+    w.bit(0); // b_discard_unknown_element
+    w.write(0b01, 2); // warp_mode = 1 (object_position_Y multiplied by 2)
+    w.write(0b00, 2); // reserved
+    w.write(0b00, 2); // global_trim_mode = default_trim
+    w.bit(0); // b_disable_trim_per_obj = 0
 
     w.into_bytes()
 }
@@ -317,6 +335,31 @@ fn write_count5(w: &mut BitWriter, count_minus_1: u32) {
 /// variable_bits_max(4, 4) for oa_element_size_bits.
 fn write_var_max4(w: &mut BitWriter, value: u32) {
     w.write_var(value, 4);
+}
+
+/// Encode the 3-byte programme_information() payload (TS 102 366 H.3.2) we carry next to OAMD
+/// and JOC. `ph90filt` must match the core: set it when `downmix --surround-phase-shift` applied
+/// the +90° Ls/Rs all-pass. The DRC profile fields are informational; they describe the profile
+/// the core encoder would have used for `compr`/`dynrng` data.
+pub fn encode_program_info(ph90filt: bool, dynrngprof: u8, comprprof: u8) -> Vec<u8> {
+    assert!(dynrngprof < 8 && comprprof < 8, "DRC profile is 3 bits");
+    let mut w = BitWriter::new();
+    w.write(0, 2); // version = 0
+    w.bit(0); // activechane = 0
+    w.bit(0); // dmixtype = 0
+    w.bit(0); // upmixtype = 0
+    w.bit(1); // preproinfoe = 1
+    w.bit(0); // suratten = 0
+    w.bit(ph90filt as u32); // ph90filt: +90° Ls/Rs all-pass applied
+    w.bit(1); // lfefilt = 1
+    w.write(0, 2); // lfemonlevcod = 0 (not indicated)
+    w.bit(1); // drcprofinfoe = 1
+    w.write(dynrngprof as u32, 3);
+    w.write(comprprof as u32, 3);
+    w.bit(0); // specprocinfoe = 0
+    w.bit(0); // chancplinfoe = 0
+    w.bit(0); // enhncrnge = 0
+    w.into_bytes()
 }
 
 // --------------------------------------------------------------------------- EMDF protection seam
@@ -940,31 +983,38 @@ fn decode_oamd(r: &mut BitReader) -> DecodedOamd {
 
     let mut objects = Vec::new();
     for _ in 0..element_count {
-        let _elem_id = r.read(4);
-        let size = r.read_var(4, 4) as usize; // element size bits - 1
-        let elem_end = r.pos + size + 1;
+        let elem_id = r.read(4);
+        // oa_element_size is the total length in bytes (TS 103 420 §5.6.4.3), measured from
+        // b_discard_unknown_element (or the alternate id, which we do not emit).
+        let size_bytes = r.read_var(4, 4) as usize + 1;
+        let elem_end = r.pos + size_bytes * 8;
+        if elem_end > r.end {
+            break; // truncated / not our payload
+        }
         let _discard = r.read_bit();
-        // object_element → md_update_info
-        let _soc = r.read(2);
-        let num_blocks = r.read(3) as usize + 1;
-        for _ in 0..num_blocks {
-            let _bof = r.read(6);
-            let rdc = r.read(2);
-            if rdc == 3 {
-                if r.read_bit() {
-                    r.read(4);
-                } else {
-                    r.read(11);
+        if elem_id == 1 {
+            // object_element → md_update_info
+            let _soc = r.read(2);
+            let num_blocks = r.read(3) as usize + 1;
+            for _ in 0..num_blocks {
+                let _bof = r.read(6);
+                let rdc = r.read(2);
+                if rdc == 3 {
+                    if r.read_bit() {
+                        r.read(4);
+                    } else {
+                        r.read(11);
+                    }
                 }
             }
-        }
-        let _resv = r.read_bit();
-        // object_data: object_count objects × num_blocks blocks
-        for obj in 0..object_count {
-            let is_bed = obj < bed_count;
-            for blk in 0..num_blocks {
-                if let Some(d) = decode_object_info_block(r, blk, is_bed) {
-                    objects.push(d);
+            let _resv = r.read_bit();
+            // object_data: object_count objects × num_blocks blocks
+            for obj in 0..object_count {
+                let is_bed = obj < bed_count;
+                for blk in 0..num_blocks {
+                    if let Some(d) = decode_object_info_block(r, blk, is_bed) {
+                        objects.push(d);
+                    }
                 }
             }
         }
@@ -1097,44 +1147,67 @@ pub fn dump_oamd_verbose(payload: &[u8]) {
     );
     for e in 0..element_count {
         let elem_id = r.read(4);
-        let size = r.read_var(4, 4) as usize;
-        let elem_end = r.pos + size + 1;
+        let size_bytes = r.read_var(4, 4) as usize + 1;
+        let elem_end = r.pos + size_bytes * 8;
         let discard = r.read_bit();
-        let soc = r.read(2);
-        let num_blocks = r.read(3) as usize + 1;
-        println!(
-            "  elem[{e}]: id={elem_id} size_bits={} discard={} sample_offset_code={soc} num_blocks={num_blocks}",
-            size + 1,
-            discard as u8
-        );
-        for blk in 0..num_blocks {
-            let bof = r.read(6);
-            let rdc = r.read(2);
-            let mut extra = String::new();
-            if rdc == 3 {
-                if r.read_bit() {
-                    extra = format!(" ramp4={}", r.read(4));
-                } else {
-                    extra = format!(" ramp11={}", r.read(11));
+        if elem_end > r.end {
+            println!("  elem[{e}]: id={elem_id} size_bytes={size_bytes} (truncated)");
+            break;
+        }
+        if elem_id == 1 {
+            let soc = r.read(2);
+            let num_blocks = r.read(3) as usize + 1;
+            println!(
+                "  elem[{e}]: id=1 (object) size_bytes={size_bytes} discard={} sample_offset_code={soc} num_blocks={num_blocks}",
+                discard as u8
+            );
+            for blk in 0..num_blocks {
+                let bof = r.read(6);
+                let rdc = r.read(2);
+                let mut extra = String::new();
+                if rdc == 3 {
+                    if r.read_bit() {
+                        extra = format!(" ramp4={}", r.read(4));
+                    } else {
+                        extra = format!(" ramp11={}", r.read(11));
+                    }
+                }
+                println!("    block[{blk}]: offset_factor={bof} ramp_code={rdc}{extra}");
+            }
+            let resv = r.read_bit();
+            println!("    b_reserved_data_not_present={}", resv as u8);
+            for obj in 0..object_count {
+                let is_bed = obj < bed_count;
+                for blk in 0..num_blocks {
+                    dump_object_info_block(&mut r, blk, is_bed, obj);
                 }
             }
-            println!("    block[{blk}]: offset_factor={bof} ramp_code={rdc}{extra}");
-        }
-        let resv = r.read_bit();
-        println!("    b_reserved_data_not_present={}", resv as u8);
-        for obj in 0..object_count {
-            let is_bed = obj < bed_count;
-            for blk in 0..num_blocks {
-                dump_object_info_block(&mut r, blk, is_bed, obj);
-            }
+        } else if elem_id == 2 {
+            let warp_mode = r.read(2);
+            let reserved = r.read(2);
+            let global_trim_mode = r.read(2);
+            let disable_per_obj = r.read_bit();
+            println!(
+                "  elem[{e}]: id=2 (trim) size_bytes={size_bytes} discard={} warp_mode={warp_mode} reserved={reserved} global_trim_mode={global_trim_mode} b_disable_trim_per_obj={}",
+                discard as u8, disable_per_obj as u8
+            );
+        } else {
+            println!(
+                "  elem[{e}]: id={elem_id} size_bytes={size_bytes} discard={} (skipped)",
+                discard as u8
+            );
         }
         let used_end = r.pos;
         let payload_bits = payload.len() * 8;
         let pad = elem_end.saturating_sub(used_end);
+        let pad_zero = (used_end..elem_end).all(|p| (payload[p >> 3] >> (7 - (p & 7))) & 1 == 0);
         println!(
-            "    [parse used to bit {used_end}; elem_end={elem_end} (pad {pad}); payload_bits={payload_bits}] {}",
+            "    [parse used to bit {used_end}; elem_end={elem_end} (pad {pad}, {}); payload_bits={payload_bits}] {}",
+            if pad_zero { "zero" } else { "NONZERO" },
             if used_end == elem_end {
                 "CLEAN"
+            } else if used_end < elem_end && pad_zero {
+                "CLEAN (padding)"
             } else {
                 "MISALIGNED vs our model"
             }
@@ -1476,6 +1549,60 @@ mod tests {
             assert_eq!(got, v, "var roundtrip n={n}");
             assert!(r.pos <= total + 7);
         }
+    }
+
+    #[test]
+    fn program_info_sets_ph90filt_and_matches_dme_bytes() {
+        // ph90filt=0, DRC profiles 2/2 (the old hard-coded payload).
+        assert_eq!(encode_program_info(false, 2, 2), vec![0x04, 0x94, 0x80]);
+        // ph90filt=1 for a phase-shifted core, same DRC profiles.
+        assert_eq!(encode_program_info(true, 2, 2), vec![0x05, 0x94, 0x80]);
+        // DME's companion payload for this master: Music Light 4/4, with/without the phase shift.
+        assert_eq!(encode_program_info(false, 4, 4), vec![0x04, 0x99, 0x00]);
+        assert_eq!(encode_program_info(true, 4, 4), vec![0x05, 0x99, 0x00]);
+    }
+
+    #[test]
+    fn oamd_element_size_is_in_bytes_and_trim_follows() {
+        // 15 dynamic objects + the LFE bed = 16 objects, the same shape as the 16ch master.
+        // The object element body is 484 bits, so b_discard_unknown_element + body + padding is
+        // 61 bytes (field value 60), matching DME. The trim element adds one byte.
+        let objs: Vec<ObjectPos> = (0..15)
+            .map(|i| {
+                let t = i as f32 / 14.0;
+                ObjectPos {
+                    x: t * 2.0 - 1.0,
+                    y: 1.0 - t * 2.0,
+                    z: t,
+                }
+            })
+            .collect();
+        let payload = encode_oamd(&objs, true);
+        assert_eq!(payload.len(), 67, "same OAMD size as DME");
+        let mut r = BitReader::new(&payload);
+        assert_eq!(r.read(2), 0, "oa_md_version");
+        assert_eq!(read_count5(&mut r), 15, "16 objects → count-1");
+        assert!(r.read_bit(), "b_dyn_object_only_program");
+        assert!(r.read_bit(), "b_lfe_present");
+        assert!(!r.read_bit(), "b_alternate_object_data_present");
+        assert_eq!(r.read(4), 2, "object_element + trim_element");
+        assert_eq!(r.read(4), 1, "object_element id");
+        let size_bytes = r.read_var(4, 4) as usize + 1;
+        assert_eq!(size_bytes, 61, "oa_element_size is bytes, not bits");
+        let element_start = r.pos;
+        r.pos = element_start + size_bytes * 8;
+
+        assert_eq!(r.read(4), 2, "trim_element id");
+        let trim_bytes = r.read_var(4, 4) as usize + 1;
+        assert_eq!(trim_bytes, 1);
+        let trim_start = r.pos;
+        assert!(!r.read_bit(), "b_discard_unknown_element");
+        assert_eq!(r.read(2), 1, "warp_mode = Y x2");
+        assert_eq!(r.read(2), 0, "reserved");
+        assert_eq!(r.read(2), 0, "global_trim_mode = default");
+        assert!(!r.read_bit(), "b_disable_trim_per_obj");
+        r.pos = trim_start + trim_bytes * 8;
+        assert_eq!(payload.len() * 8 - r.pos, 3, "payload padding");
     }
 
     #[test]

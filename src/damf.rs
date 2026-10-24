@@ -80,6 +80,8 @@ pub struct Event {
     pub pos: Option<Vec<f64>>,
     /// Movement ramp length in samples. Only written when it changes for an element.
     pub ramp_length: Option<u64>,
+    /// Per-object trim bypass. DME carries the inverse as `b_disable_trim_per_obj`.
+    pub trim_bypass: Option<bool>,
 }
 
 impl Metadata {
