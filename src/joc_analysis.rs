@@ -13,6 +13,7 @@
 
 use anyhow::{Context, Result, ensure};
 use rustfft::{Fft, FftPlanner, num_complex::Complex32};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use crate::damf;
 use crate::joc::{self, ENC_BANDS};
 use crate::joc_tables::PARAM_BAND_EDGES;
+use crate::phase_shift;
 use crate::render;
 
 /// FFT analysis size and hop. At 48 kHz a 1024-point FFT gives 8 bins per 375 Hz QMF subband.
@@ -127,22 +129,38 @@ impl Stats {
 
 /// Optional decoded 5.1 core PCM feed. The product pipeline will get this from
 /// ffmpeg-next; for research/CLI use it is a raw f32le pipe (`ffmpeg ... -f f32le -`).
+///
+/// When the core was encoded from a phase-shifted downmix (`dmx_config=3`), `shift` applies the
+/// decoder's inverse all-pass to the decoded Ls/Rs before they reach the JOC statistics. This is
+/// the `P⁻¹(Dec(Enc(P(D))))` reference from the encoder side: a continuous streaming FIR, not a
+/// per-analysis-window rotation, so the 5–80 Hz transition and sample alignment are exact.
 struct CorePcm {
     reader: Box<dyn Read>,
     channels: usize,
     delay: usize,
     buf: Vec<u8>,
     eof: bool,
+    shift: Option<phase_shift::SurroundPhaseShift>,
+    finished_shift: bool,
+    /// L,R,C of every decoded frame not yet paired with a shifted Ls/Rs.
+    pending: VecDeque<[f32; 3]>,
+    ready_ls: VecDeque<f32>,
+    ready_rs: VecDeque<f32>,
 }
 
 impl CorePcm {
-    fn new(reader: Box<dyn Read>, channels: usize, delay: usize) -> Self {
+    fn new(reader: Box<dyn Read>, channels: usize, delay: usize, inverse_shift: bool) -> Self {
         Self {
             reader,
             channels,
             delay,
             buf: Vec::new(),
             eof: false,
+            shift: inverse_shift.then(phase_shift::SurroundPhaseShift::inverse),
+            finished_shift: false,
+            pending: VecDeque::new(),
+            ready_ls: VecDeque::new(),
+            ready_rs: VecDeque::new(),
         }
     }
 
@@ -150,6 +168,15 @@ impl CorePcm {
     /// deinterleave L,R,C,Ls,Rs into `dst` (5 floats/frame). Missing samples at EOF
     /// are zero-filled.
     fn read_block(&mut self, frames: usize, dst: &mut Vec<f32>) -> std::io::Result<()> {
+        dst.clear();
+        dst.resize(frames * 5, 0.0);
+        if self.shift.is_none() {
+            return self.read_block_direct(frames, dst);
+        }
+        self.read_block_shifted(frames, dst)
+    }
+
+    fn read_block_direct(&mut self, frames: usize, dst: &mut [f32]) -> std::io::Result<()> {
         let ch = self.channels;
         let skip = self.delay;
         let raw_frames = skip + frames;
@@ -168,8 +195,6 @@ impl CorePcm {
         let start = skip.min(complete);
         self.delay = skip - start;
         let take = complete.saturating_sub(start).min(frames);
-        dst.clear();
-        dst.resize(frames * 5, 0.0);
         for i in 0..take {
             let base = (start + i) * ch * 4;
             let sample = |c: usize| -> f32 {
@@ -187,6 +212,89 @@ impl CorePcm {
             dst[o + 2] = sample(2); // C
             dst[o + 3] = sample(4); // Ls
             dst[o + 4] = sample(5); // Rs
+        }
+        Ok(())
+    }
+
+    fn read_block_shifted(&mut self, frames: usize, dst: &mut [f32]) -> std::io::Result<()> {
+        let ch = self.channels;
+        const CHUNK: usize = 4096;
+        let mut written = 0usize;
+        let mut ls_in = Vec::with_capacity(CHUNK);
+        let mut rs_in = Vec::with_capacity(CHUNK);
+        let mut ls_out = Vec::new();
+        let mut rs_out = Vec::new();
+        while written < frames {
+            while written < frames && !self.pending.is_empty() && !self.ready_ls.is_empty() {
+                let p = self.pending.pop_front().unwrap();
+                let o = written * 5;
+                dst[o] = p[0];
+                dst[o + 1] = p[1];
+                dst[o + 2] = p[2];
+                dst[o + 3] = self.ready_ls.pop_front().unwrap();
+                dst[o + 4] = self.ready_rs.pop_front().unwrap();
+                written += 1;
+            }
+            if written == frames {
+                break;
+            }
+            if self.eof && self.pending.is_empty() && self.ready_ls.is_empty() {
+                break;
+            }
+
+            let skip = self.delay;
+            let raw_frames = skip + CHUNK;
+            let bytes = raw_frames * ch * 4;
+            self.buf.resize(bytes, 0);
+            let mut got = 0usize;
+            while got < bytes && !self.eof {
+                match self.reader.read(&mut self.buf[got..bytes]) {
+                    Ok(0) => self.eof = true,
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let complete = got / (ch * 4);
+            let start = skip.min(complete);
+            self.delay = skip - start;
+            let take = complete.saturating_sub(start).min(CHUNK);
+            ls_in.clear();
+            rs_in.clear();
+            for i in 0..take {
+                let base = (start + i) * ch * 4;
+                let sample = |c: usize| -> f32 {
+                    let p = base + c * 4;
+                    f32::from_le_bytes([
+                        self.buf[p],
+                        self.buf[p + 1],
+                        self.buf[p + 2],
+                        self.buf[p + 3],
+                    ])
+                };
+                self.pending.push_back([sample(0), sample(1), sample(2)]);
+                ls_in.push(sample(4));
+                rs_in.push(sample(5));
+            }
+            let shift = self.shift.as_mut().expect("shifted core path");
+            if take > 0 {
+                shift.feed(&ls_in, &rs_in);
+            }
+            if self.eof && !self.finished_shift {
+                shift.finish();
+                self.finished_shift = true;
+            } else {
+                shift.produce();
+            }
+            ls_out.clear();
+            rs_out.clear();
+            shift.drain(&mut ls_out, &mut rs_out);
+            self.ready_ls.extend(ls_out.iter().copied());
+            self.ready_rs.extend(rs_out.iter().copied());
+
+            if self.eof && take == 0 {
+                break;
+            }
         }
         Ok(())
     }
@@ -237,6 +345,7 @@ pub(crate) struct JocAnalyzer {
 }
 
 impl JocAnalyzer {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         caf_path: &Path,
         dir: &Path,
@@ -245,6 +354,7 @@ impl JocAnalyzer {
         core_pcm_path: Option<&Path>,
         core_delay: usize,
         joc_lambda: f64,
+        surround_phase_shift: bool,
     ) -> Result<Self> {
         let caf = damf::read_caf_info(caf_path)?;
         ensure!(
@@ -309,7 +419,7 @@ impl JocAnalyzer {
                     core_delay < 48000,
                     "core delay {core_delay} samples is implausible"
                 );
-                Some(CorePcm::new(reader, 6, core_delay))
+                Some(CorePcm::new(reader, 6, core_delay, surround_phase_shift))
             }
             None => None,
         };
@@ -586,6 +696,62 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn core_pcm_inverse_shift_recovers_unshifted_surround() {
+        let n = 20_000usize;
+        let mut bytes = Vec::with_capacity(n * 6 * 4);
+        for i in 0..n {
+            let s = (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48_000.0).sin() as f32;
+            let frame = [i as f32 * 1e-4, -(i as f32) * 1e-4, 0.25, 0.0, s, s];
+            for v in frame {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let mut core = CorePcm::new(Box::new(Cursor::new(bytes)), 6, 0, true);
+        let mut all = Vec::new();
+        let mut pos = 0;
+        while pos < n {
+            let take = (n - pos).min(997);
+            let mut dst = Vec::new();
+            core.read_block(take, &mut dst).unwrap();
+            assert_eq!(dst.len(), take * 5);
+            all.extend_from_slice(&dst);
+            pos += take;
+        }
+        assert_eq!(all.len(), n * 5);
+        // L/R/C bypass the surround filter and stay sample-aligned with their input.
+        for i in 0..n {
+            assert!((all[i * 5] - i as f32 * 1e-4).abs() < 1e-6);
+            assert!((all[i * 5 + 1] + i as f32 * 1e-4).abs() < 1e-6);
+            assert!((all[i * 5 + 2] - 0.25).abs() < 1e-6);
+        }
+        // The inverse all-pass is -90 deg at 1 kHz: y = sin(wt - pi/2) = -cos(wt).
+        // Zero-phase lookahead means this must hold at the same sample index.
+        let skip = phase_shift::HALF_LEN + 1;
+        let mut a = 0.0f64;
+        let mut b = 0.0f64;
+        let mut es = 0.0f64;
+        let mut ec = 0.0f64;
+        for ch in [3usize, 4] {
+            a = 0.0;
+            b = 0.0;
+            es = 0.0;
+            ec = 0.0;
+            for i in skip..n - skip {
+                let w = 2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48_000.0;
+                let y = all[i * 5 + ch] as f64;
+                a += y * w.sin();
+                b += y * w.cos();
+                es += w.sin() * w.sin();
+                ec += w.cos() * w.cos();
+            }
+            let a = a / es;
+            let b = b / ec;
+            assert!(a.abs() < 0.05, "in-phase component {a}");
+            assert!((b + 1.0).abs() < 0.05, "quadrature component {b} (want -1)");
+        }
+    }
+
+    #[test]
     fn core_pcm_skips_delay_and_maps_51_to_five() {
         let frames = [
             [10.0f32, 11.0, 12.0, 13.0, 14.0, 15.0],
@@ -598,7 +764,7 @@ mod tests {
                 bytes.extend_from_slice(&s.to_le_bytes());
             }
         }
-        let mut core = CorePcm::new(Box::new(Cursor::new(bytes)), 6, 1);
+        let mut core = CorePcm::new(Box::new(Cursor::new(bytes)), 6, 1, false);
         let mut dst = Vec::new();
         core.read_block(2, &mut dst).unwrap();
         assert_eq!(

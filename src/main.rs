@@ -25,6 +25,7 @@ mod emdf;
 mod joc;
 mod joc_analysis;
 mod joc_tables;
+mod phase_shift;
 mod render;
 
 use anyhow::{Context, Result};
@@ -78,6 +79,10 @@ enum Command {
         /// Downmix panning law: `hard` (DME-style nearest-speaker + height trim) or `vbap`.
         #[arg(long, value_enum, default_value = "hard")]
         pan: render::PanMode,
+        /// Apply DME's +90° surround all-pass to Ls/Rs before E-AC-3. Pair with
+        /// `atmos --surround-phase-shift`, which writes `joc_dmx_config_idx=3`.
+        #[arg(long)]
+        surround_phase_shift: bool,
     },
     /// Parse a raw E-AC-3 (.eac3/.ec3) elementary stream and report its syncframe structure.
     Eac3probe {
@@ -139,6 +144,11 @@ enum Command {
         /// Per-object fine/coarse fallback selection.
         #[arg(long, value_enum, default_value = "knapsack")]
         joc_select: JocSelect,
+        /// The core was encoded from a +90°-shifted downmix (`downmix --surround-phase-shift`).
+        /// Writes `joc_dmx_config_idx=3` and inverse-shifts `--core-pcm` before JOC analysis, so
+        /// the matrices are solved against the unshifted 5.1 downmix the decoder reconstructs.
+        #[arg(long)]
+        surround_phase_shift: bool,
     },
     /// Find + decode the JOC payload in a real DD+ Atmos stream (EMDF at any bit offset, e.g.
     /// skip-field carriage). Dumps one frame in detail, then aggregate stats over all frames.
@@ -433,7 +443,8 @@ fn main() -> Result<()> {
             out,
             gain_db,
             pan,
-        } => render::downmix(&atmos, &out, gain_db, pan),
+            surround_phase_shift,
+        } => render::downmix(&atmos, &out, gain_db, pan, surround_phase_shift),
         Command::Eac3probe { input } => eac3probe(&input),
         Command::Eac3inject { input, out, marker } => eac3inject(&input, &out, &marker),
         Command::Oamd { core, atmos, out } => oamd_inject(&core, &atmos, &out),
@@ -447,6 +458,7 @@ fn main() -> Result<()> {
             joc_lambda,
             emdf_budget,
             joc_select,
+            surround_phase_shift,
         } => atmos_inject(
             &core,
             &atmos,
@@ -457,6 +469,7 @@ fn main() -> Result<()> {
             joc_lambda,
             emdf_budget,
             joc_select,
+            surround_phase_shift,
         ),
         Command::Jocprobe { input, frame } => jocprobe(&input, frame),
         Command::Walkprobe { input } => walkprobe(&input),
@@ -712,6 +725,7 @@ fn load_ctx(
     core_pcm: Option<&Path>,
     core_delay: usize,
     joc_lambda: f64,
+    surround_phase_shift: bool,
 ) -> Result<AtmosCtx> {
     let manifest = damf::Manifest::load(atmos)?;
     let dir = atmos.parent().unwrap_or_else(|| Path::new("."));
@@ -771,6 +785,7 @@ fn load_ctx(
         core_pcm,
         core_delay,
         joc_lambda,
+        surround_phase_shift,
     )
     .context("setting up per-band JOC analysis")?;
 
@@ -811,12 +826,22 @@ fn atmos_inject(
     joc_lambda: f64,
     emdf_budget: usize,
     joc_select: JocSelect,
+    surround_phase_shift: bool,
 ) -> Result<()> {
     anyhow::ensure!(
         (1..=511).contains(&emdf_budget),
         "EMDF budget must be 1..=511 bytes"
     );
-    let mut ctx = load_ctx(core, atmos, pan, core_pcm, core_delay, joc_lambda)?;
+    let mut ctx = load_ctx(
+        core,
+        atmos,
+        pan,
+        core_pcm,
+        core_delay,
+        joc_lambda,
+        surround_phase_shift,
+    )?;
+    let dmx_config = if surround_phase_shift { 3 } else { 0 };
     let object_count = ctx.nobj + 1; // + LFE bed
     let complexity = object_count.min(16) as u8;
     // addbsi §8.3: reserved(7)=0 · flag_ec3_extension_type_a(1)=1 · complexity_index_type_a(8).
@@ -873,7 +898,9 @@ fn atmos_inject(
         let mut chosen: Option<(Vec<u8>, u8)> = None; // (EMDF, mode)
         for per_band in [true, false] {
             let mut quants = vec![1u8; nobj];
-            let mut p = make_payload(joc::encode_joc_per_object(&mtx, seq, &quants, per_band));
+            let mut p = make_payload(joc::encode_joc_per_object(
+                &mtx, seq, &quants, per_band, dmx_config,
+            ));
             if p.len() > emdf_budget {
                 if per_band && matches!(joc_select, JocSelect::Knapsack) {
                     // Exact per-object knapsack: minimise summed coarse distortion for the
@@ -894,8 +921,9 @@ fn atmos_inject(
                         let matrix_budget = avail_bits.saturating_sub(header);
                         if let Some(mask) = joc::select_coarse_objects(&rate_vec, matrix_budget) {
                             let q2: Vec<u8> = mask.iter().map(|&c| if c { 0 } else { 1 }).collect();
-                            let p2 =
-                                make_payload(joc::encode_joc_per_object(&mtx, seq, &q2, per_band));
+                            let p2 = make_payload(joc::encode_joc_per_object(
+                                &mtx, seq, &q2, per_band, dmx_config,
+                            ));
                             if p2.len() <= budget {
                                 selected = Some((q2, p2));
                                 break;
@@ -911,7 +939,9 @@ fn atmos_inject(
                         p = p2;
                     } else {
                         quants = vec![0u8; nobj];
-                        p = make_payload(joc::encode_joc_per_object(&mtx, seq, &quants, per_band));
+                        p = make_payload(joc::encode_joc_per_object(
+                            &mtx, seq, &quants, per_band, dmx_config,
+                        ));
                     }
                 } else {
                     // Greedy fallback (also used for the broadband mode, whose bit costs are
@@ -920,13 +950,17 @@ fn atmos_inject(
                     for obj in 0..nobj {
                         let mut q2 = quants.clone();
                         q2[obj] = 0;
-                        let p2 = make_payload(joc::encode_joc_per_object(&mtx, seq, &q2, per_band));
+                        let p2 = make_payload(joc::encode_joc_per_object(
+                            &mtx, seq, &q2, per_band, dmx_config,
+                        ));
                         order.push((p.len().saturating_sub(p2.len()), obj));
                     }
                     order.sort_by_key(|b| std::cmp::Reverse(b.0));
                     for (_, obj) in order {
                         quants[obj] = 0;
-                        p = make_payload(joc::encode_joc_per_object(&mtx, seq, &quants, per_band));
+                        p = make_payload(joc::encode_joc_per_object(
+                            &mtx, seq, &quants, per_band, dmx_config,
+                        ));
                         if p.len() <= emdf_budget {
                             break;
                         }
@@ -1013,7 +1047,8 @@ fn atmos_inject(
     let out_sz = std::fs::metadata(out)?.len();
     let grew = out_sz as i64 - in_sz as i64;
     println!(
-        "Atmos inject: addbsi flag (complexity={complexity}) + OAMD ({} dyn + 1 LFE) + JOC ({} obj, avg {} B EMDF/frame) → {} frames",
+        "Atmos inject: dmx_config={dmx_config} (surround phase shift {}), addbsi flag (complexity={complexity}) + OAMD ({} dyn + 1 LFE) + JOC ({} obj, avg {} B EMDF/frame) → {} frames",
+        if surround_phase_shift { "+90°" } else { "off" },
         ctx.nobj,
         ctx.nobj,
         emdf_bytes / nframes,

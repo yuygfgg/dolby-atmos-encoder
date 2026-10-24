@@ -4,7 +4,9 @@
 //! exists to validate our understanding against real Dolby payloads; the encoder is ours.
 //!
 //! A JOC payload describes, per object, a mixing matrix over the core downmix channels
-//! (5 full-bandwidth channels for joc_dmx_config_idx 0) × parameter bands (grouped QMF subbands).
+//! (5 full-bandwidth channels for joc_dmx_config_idx 0 and 3) × parameter bands (grouped QMF
+//! subbands). Config 3 is the same 5.1 layout with DME's +90° Ls/Rs all-pass in the core; the
+//! decoder removes that phase before applying the matrices.
 //! The decoder reconstructs each object as `obj[sb] = Σ_ch M[ch][band(sb)] · core_ch[sb]`.
 //! Matrix values are quantized around a center then band-differentially Huffman coded.
 
@@ -270,12 +272,13 @@ pub fn dequantize_gain(q: i32) -> f32 {
 }
 
 /// Encode one JOC frame. `matrices[obj][band][ch]` = mixing gain reconstructing dynamic object
-/// `obj` in parameter band `band` from core channel `ch` (order L, R, C, Ls, Rs —
-/// joc_dmx_config_idx 0; the LFE is bypassed and must not be included). Each channel's 12 band
+/// `obj` in parameter band `band` from core channel `ch` (order L, R, C, Ls, Rs; the LFE is
+/// bypassed and must not be included). `dmx_config` is 0 (unshifted core) or 3 (DME +90°
+/// surround all-pass; the decoder removes it). Each channel's 12 band
 /// gains are band-differentially Huffman coded, so neighbouring bands share the first-band code
 /// only through the differential prediction, not by being forced equal.
 pub fn encode_joc(matrices: &[[[f32; 5]; ENC_BANDS]], seq: u16) -> Vec<u8> {
-    encode_joc_ex(matrices, seq, 1, true)
+    encode_joc_ex(matrices, seq, 1, true, 0)
 }
 
 /// General JOC frame encoder. `quant=1` is fine (0.1 step), `quant=0` coarse (0.2 step).
@@ -287,9 +290,10 @@ pub fn encode_joc_ex(
     seq: u16,
     quant: u8,
     per_band: bool,
+    dmx_config: u8,
 ) -> Vec<u8> {
     let quants = vec![quant; matrices.len()];
-    encode_joc_per_object(matrices, seq, &quants, per_band)
+    encode_joc_per_object(matrices, seq, &quants, per_band, dmx_config)
 }
 
 /// JOC frame encoder with a per-object fine/coarse choice (`quants[obj]`). The JOC syntax carries
@@ -301,13 +305,20 @@ pub fn encode_joc_per_object(
     seq: u16,
     quants: &[u8],
     per_band: bool,
+    dmx_config: u8,
 ) -> Vec<u8> {
     let nobj = matrices.len();
     assert!((1..=64).contains(&nobj), "JOC supports 1..=64 objects");
     assert_eq!(quants.len(), nobj, "one quantizer per object");
+    assert!(
+        dmx_config == 0 || dmx_config == 3,
+        "only 5.1 core configs 0 and 3 are supported"
+    );
     let mut w = BitWriter::new();
     // joc_header()
-    w.write(0, 3); // joc_dmx_config_idx = 0 (5.1 core: L R C Ls Rs + bypassed LFE)
+    // 0 = 5.1 core (L R C Ls Rs + bypassed LFE), no surround phase shift.
+    // 3 = same layout, but the core Ls/Rs carry the +90° all-pass and the decoder removes it.
+    w.write(dmx_config as u32, 3);
     w.write((nobj - 1) as u32, 6);
     w.write(0, 3); // joc_ext_config_idx = 0
     // joc_info()
@@ -811,6 +822,16 @@ mod tests {
     }
 
     #[test]
+    fn dmx_config_3_roundtrip() {
+        let matrices = vec![[[0.25f32; 5]; ENC_BANDS]; 2];
+        let payload = encode_joc_ex(&matrices, 9, 1, true, 3);
+        let f = decode_joc(&payload).expect("decode dmx_config 3");
+        assert_eq!(f.dmx_config, 3);
+        assert_eq!(f.channel_count, 5);
+        assert_eq!(f.object_count, 2);
+    }
+
+    #[test]
     fn coarse_and_broadband_modes_roundtrip() {
         let mut matrices = vec![[[0f32; 5]; ENC_BANDS]; 2];
         for (obj, obj_mtx) in matrices.iter_mut().enumerate() {
@@ -824,7 +845,7 @@ mod tests {
         for quant in [0u8, 1] {
             for per_band in [true, false] {
                 let (center, range, step) = quant_params(quant);
-                let payload = encode_joc_ex(&matrices, 7, quant, per_band);
+                let payload = encode_joc_ex(&matrices, 7, quant, per_band, 0);
                 let f = decode_joc(&payload).expect("decode");
                 for (oi, obj) in f.objects.iter().enumerate() {
                     assert_eq!(obj.quant, quant);
@@ -875,7 +896,7 @@ mod tests {
             }
         }
         let quants = [1u8, 0u8];
-        let payload = encode_joc_per_object(&matrices, 77, &quants, true);
+        let payload = encode_joc_per_object(&matrices, 77, &quants, true, 0);
         let f = decode_joc(&payload).expect("decode mixed quant");
         assert_eq!(f.objects[0].quant, 1);
         assert_eq!(f.objects[1].quant, 0);

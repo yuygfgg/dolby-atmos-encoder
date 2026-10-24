@@ -178,7 +178,13 @@ pub(crate) fn gain_keyframes(
     keys
 }
 
-pub fn downmix(atmos: &Path, out: &Path, gain_db: f64, mode: PanMode) -> Result<()> {
+pub fn downmix(
+    atmos: &Path,
+    out: &Path,
+    gain_db: f64,
+    mode: PanMode,
+    surround_phase_shift: bool,
+) -> Result<()> {
     let manifest = damf::Manifest::load(atmos)?;
     let dir = atmos.parent().unwrap_or_else(|| Path::new("."));
     let pres = manifest
@@ -262,12 +268,24 @@ pub fn downmix(atmos: &Path, out: &Path, gain_db: f64, mode: PanMode) -> Result<
     let mut t: u64 = 0;
     let mut remaining = total_frames;
 
+    // DME applies its +90° all-pass after the downmix, to the summed Ls/Rs only. Keep the four
+    // other core channels untouched and delay them only long enough to pair them with the
+    // filter's lookahead output.
+    let mut shift = surround_phase_shift.then(crate::phase_shift::SurroundPhaseShift::forward);
+    let mut pending: std::collections::VecDeque<[f32; 4]> = std::collections::VecDeque::new();
+    let mut ls_in: Vec<f32> = Vec::with_capacity(block);
+    let mut rs_in: Vec<f32> = Vec::with_capacity(block);
+    let mut ls_out: Vec<f32> = Vec::new();
+    let mut rs_out: Vec<f32> = Vec::new();
+
     while remaining > 0 {
         let this = remaining.min(block as u64) as usize;
         let nbytes = this * channels * 3;
         r.read_exact(&mut inbuf[..nbytes])
             .with_context(|| format!("reading essence at frame {t}"))?;
         outbuf.clear();
+        ls_in.clear();
+        rs_in.clear();
         for f in 0..this {
             let base = f * channels * 3;
             let mut o = [0f32; 6];
@@ -289,18 +307,62 @@ pub fn downmix(atmos: &Path, out: &Path, gain_db: f64, mode: PanMode) -> Result<
                 o[4] += s * g[3]; // Ls
                 o[5] += s * g[4]; // Rs
             }
-            // Apply makeup gain to mains (not LFE) and write.
+            // Apply makeup gain to mains (not LFE).
             for k in [0usize, 1, 2, 4, 5] {
                 o[k] *= lin;
             }
-            for k in 0..6 {
-                peak[k] = peak[k].max(o[k].abs());
-                outbuf.extend_from_slice(&o[k].to_le_bytes());
+            if shift.is_some() {
+                pending.push_back([o[0], o[1], o[2], o[3]]);
+                ls_in.push(o[4]);
+                rs_in.push(o[5]);
+            } else {
+                for k in 0..6 {
+                    peak[k] = peak[k].max(o[k].abs());
+                    outbuf.extend_from_slice(&o[k].to_le_bytes());
+                }
             }
             t += 1;
         }
+        if let Some(sh) = shift.as_mut() {
+            sh.feed(&ls_in, &rs_in);
+            sh.produce();
+            ls_out.clear();
+            rs_out.clear();
+            sh.drain(&mut ls_out, &mut rs_out);
+            let n = ls_out.len().min(pending.len());
+            for i in 0..n {
+                let p = pending.pop_front().unwrap();
+                let vals = [p[0], p[1], p[2], p[3], ls_out[i], rs_out[i]];
+                for (k, v) in vals.iter().enumerate() {
+                    peak[k] = peak[k].max(v.abs());
+                    outbuf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
         w.write_all(&outbuf)?;
         remaining -= this as u64;
+    }
+
+    if let Some(sh) = shift.as_mut() {
+        sh.finish();
+        ls_out.clear();
+        rs_out.clear();
+        sh.drain(&mut ls_out, &mut rs_out);
+        anyhow::ensure!(
+            ls_out.len() == pending.len(),
+            "phase shift produced {} frames for {} pending",
+            ls_out.len(),
+            pending.len()
+        );
+        outbuf.clear();
+        for (p, (&ls, &rs)) in pending.iter().zip(ls_out.iter().zip(&rs_out)) {
+            let vals = [p[0], p[1], p[2], p[3], ls, rs];
+            for (k, v) in vals.iter().enumerate() {
+                peak[k] = peak[k].max(v.abs());
+                outbuf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        w.write_all(&outbuf)?;
     }
     w.flush()?;
 

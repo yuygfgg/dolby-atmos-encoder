@@ -34,6 +34,11 @@ A near-complete reimplementation of the relevant parts of a DD+ Atmos encoder, i
   than reusing one broadband pan gain in every band, then band-differentially quantized with Dolby's
   fine/coarse Huffman tables. Frames whose payload would exceed the 9-bit skip-field limit fall back
   to coarse (then broadband) matrices for that frame only. Bit-exact round-trip.
+- **Surround phase shift (`joc_dmx_config_idx = 3`)** — DME applies a zero-delay +90° all-pass to
+  the downmixed Ls/Rs before E-AC-3, with a measured low-frequency transition (0° at DC, +90° above
+  ~80 Hz). `downmix --surround-phase-shift` applies that filter as a continuous streaming FIR;
+  `atmos --surround-phase-shift` writes flag 3 and, when `--core-pcm` is used, inverse-shifts the
+  decoded core before JOC analysis so the matrices still describe the unshifted downmix.
 - **EMDF container** (ETSI TS 102 366 Annex H) — wraps OAMD (id 11) + JOC (id 14) with the
   `emdf_protection` field, carried in the E-AC-3 audio-block **skip field** exactly where real Dolby
   streams put it (recomputing `frmsiz` + `crc2`).
@@ -96,14 +101,15 @@ truehdd decode --presentation 3 movie.thd --output-path master
 
 # 3. Render objects to a 5.1 bed, then encode an E-AC-3 core with ffmpeg.
 #    Pipe raw f32le straight into ffmpeg — works for any length (no WAV size cap):
-dolby-atmos-encoder downmix master.atmos --out - \
+dolby-atmos-encoder downmix master.atmos --out - --surround-phase-shift \
   | ffmpeg -f f32le -ar 48000 -ac 6 -i - -c:a eac3 -b:a 768k -f eac3 core.eac3
 #    (Short clips only — `--out downmix.wav` then `ffmpeg -i downmix.wav ...` — but a 5.1
 #     32-bit-float WAV is capped at 4 GB, i.e. ~58 min at 48 kHz, so prefer the pipe above.)
 
 # 4. Inject per-frame Atmos metadata (OAMD + JOC + the addbsi detection flag) into the core.
-dolby-atmos-encoder atmos core.eac3 master.atmos --out atmos.eac3
+dolby-atmos-encoder atmos core.eac3 master.atmos --out atmos.eac3 --surround-phase-shift
 #    (add  --emdf-key <hex>  to sign the EMDF protection field — see "The signing seam")
+#    (drop --surround-phase-shift from BOTH commands for the old flag-0, unshifted core)
 
 # 5. Mux into an MKV alongside your video.
 mkvmerge -o out.mkv --no-audio movie.mkv atmos.eac3
@@ -122,8 +128,8 @@ Run `--help` on each for details.
 | Command | Purpose |
 |---|---|
 | `inspect <atmos>` | Report a DAMF master's bed/object layout and metadata. |
-| `downmix <atmos> --out d.wav` | Render objects to a 5.1 bed WAV (`--out -` streams raw f32le to stdout — no 4 GB cap, pipe into ffmpeg). |
-| `atmos <core> <atmos> --out o.eac3` | Inject OAMD+JOC metadata + the addbsi flag into an E-AC-3 core. |
+| `downmix <atmos> --out d.wav [--surround-phase-shift]` | Render objects to a 5.1 bed WAV (`--out -` streams raw f32le to stdout — no 4 GB cap, pipe into ffmpeg). The optional +90° Ls/Rs all-pass matches DME. |
+| `atmos <core> <atmos> --out o.eac3 [--surround-phase-shift]` | Inject OAMD+JOC metadata + the addbsi flag into an E-AC-3 core. With the flag, write `joc_dmx_config_idx=3` (pair it with a `downmix --surround-phase-shift` core). |
 | `oamd <core> <atmos> --out o.eac3` | OAMD only (no JOC). |
 | `coregraft <realcore> <myatmos> --out o.eac3` | Splice our metadata onto a real Dolby core (diagnostic). |
 | `graft <core> <reference> --out o.eac3` | Splice Dolby's metadata onto our core (diagnostic). |
