@@ -40,10 +40,9 @@ use std::path::{Path, PathBuf};
     about = "Convert a Dolby Atmos Master (DAMF) to E-AC-3 JOC (DD+ Atmos)"
 )]
 struct Cli {
-    /// Hex Dolby EMDF authentication key (or `@path` to a file of hex). When set, the encoder signs
-    /// the EMDF protection field with the keyed protector instead of the public-CRC placeholder.
-    /// NOTE: Dolby's keyed-MAC construction is undocumented (see `emdf::dolby_keyed_mac`) — a key
-    /// alone does NOT make output hardware-valid.
+    /// Hex Dolby EMDF authentication key, `@path` to a hex file, or `@path` to a ddpmeta binary
+    /// key set. When set, the encoder computes the full frame-level EMDF protection (32-bit
+    /// primary + 8-bit secondary) after injection instead of emitting the public-CRC placeholder.
     #[arg(long, global = true, env = "DOLBY_EMDF_KEY")]
     emdf_key: Option<String>,
     /// key_id (0..7) written alongside a supplied `--emdf-key`.
@@ -228,15 +227,55 @@ enum Command {
     },
 }
 
-/// Parse a `--emdf-key` value: raw hex, or `@path` to a file of hex (whitespace ignored).
-fn parse_emdf_key(s: &str) -> Result<Vec<u8>> {
-    let text = match s.strip_prefix('@') {
-        Some(path) => {
-            std::fs::read_to_string(path).with_context(|| format!("reading key file {path}"))?
+/// `ddpmeta` binary key-set magic (version 1, `key_id`/length/key entries).
+const KEY_MAGIC: [u8; 8] = [0x89, b'E', b'M', b'K', 0x0D, 0x0A, 0x1A, 0x0A];
+
+fn parse_key_set(bytes: &[u8], key_id: u8) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        bytes.len() >= 10 && bytes[..8] == KEY_MAGIC,
+        "bad EMDF key file magic"
+    );
+    anyhow::ensure!(
+        bytes[8] == 1,
+        "unsupported EMDF key file version {}",
+        bytes[8]
+    );
+    let count = bytes[9] as usize;
+    let mut pos = 10usize;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        anyhow::ensure!(pos + 6 <= bytes.len(), "truncated EMDF key file");
+        let id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let len = u16::from_le_bytes(bytes[pos + 4..pos + 6].try_into().unwrap()) as usize;
+        pos += 6;
+        anyhow::ensure!(pos + len <= bytes.len(), "truncated EMDF key");
+        ids.push(id);
+        if id == u32::from(key_id) {
+            anyhow::ensure!(len > 0, "empty EMDF key");
+            return Ok(bytes[pos..pos + len].to_vec());
         }
-        None => s.to_string(),
+        pos += len;
+    }
+    anyhow::bail!("EMDF key_id {key_id} not found (available: {ids:?})");
+}
+
+/// Load `--emdf-key`: raw hex, `@path` to a hex file, or `@path` to a ddpmeta binary key set.
+fn load_emdf_key(s: &str, key_id: u8) -> Result<Vec<u8>> {
+    let Some(path) = s.strip_prefix('@') else {
+        return parse_emdf_key(s);
     };
-    let hex: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let bytes = std::fs::read(path).with_context(|| format!("reading key file {path}"))?;
+    if bytes.starts_with(&KEY_MAGIC) {
+        return parse_key_set(&bytes, key_id);
+    }
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("key file {path} is neither binary nor hex text"))?;
+    parse_emdf_key(&text)
+}
+
+/// Parse raw hex (whitespace ignored).
+fn parse_emdf_key(s: &str) -> Result<Vec<u8>> {
+    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     anyhow::ensure!(
         !hex.is_empty() && hex.len() % 2 == 0,
         "key must be non-empty, even-length hex"
@@ -249,7 +288,7 @@ fn parse_emdf_key(s: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod key_tests {
-    use super::parse_emdf_key;
+    use super::{KEY_MAGIC, parse_emdf_key, parse_key_set};
 
     #[test]
     fn parses_plain_hex() {
@@ -264,6 +303,23 @@ mod key_tests {
     fn rejects_empty_or_odd_length() {
         assert!(parse_emdf_key("").is_err());
         assert!(parse_emdf_key("abc").is_err());
+    }
+
+    #[test]
+    fn binary_key_set_selects_by_key_id() {
+        let mut bytes = KEY_MAGIC.to_vec();
+        bytes.extend_from_slice(&[1, 2]);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&[1, 2, 3]);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&[4, 5]);
+
+        assert_eq!(parse_key_set(&bytes, 0).unwrap(), vec![1, 2, 3]);
+        assert_eq!(parse_key_set(&bytes, 1).unwrap(), vec![4, 5]);
+        assert!(parse_key_set(&bytes, 2).is_err());
+        assert!(parse_key_set(&KEY_MAGIC, 0).is_err());
     }
 }
 
@@ -423,18 +479,21 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     if let Some(k) = cli.emdf_key.as_deref() {
-        let key = parse_emdf_key(k)?;
-        log::warn!(
-            "EMDF: signing with KEYED protector (key_id={}, {} key bytes). Dolby's keyed-MAC \
-             construction is undocumented — output is hardware-valid ONLY if emdf::dolby_keyed_mac \
-             implements the real algorithm; otherwise this is a structurally-valid stand-in.",
+        let key = load_emdf_key(k, cli.emdf_key_id)?;
+        log::info!(
+            "EMDF: keyed frame protection enabled (key_id={}, {} key bytes); primary + secondary \
+             are recomputed over the injected E-AC-3 frame",
             cli.emdf_key_id,
             key.len()
         );
         emdf::set_protector(Box::new(emdf::KeyedProtector {
-            key,
+            key: key.clone(),
             key_id: cli.emdf_key_id,
         }));
+        emdf::set_frame_signer(emdf::KeyedProtector {
+            key,
+            key_id: cli.emdf_key_id,
+        });
     }
     match cli.command {
         Command::Inspect { atmos } => inspect(&atmos),
@@ -863,6 +922,7 @@ fn atmos_inject(
     let mut coarse_frames = 0usize;
     let mut broadband_frames = 0usize;
     let mut aux_frames = 0usize;
+    let signer = emdf::frame_signer();
     let (mut flag_ok, mut oamd_ok, mut joc_ok) = (0usize, 0usize, 0usize);
     let processed = eac3::transform_frames_io_try(reader, writer, |f, i, frame| {
         let objs = frame_objects(&ctx, i);
@@ -995,15 +1055,37 @@ fn atmos_inject(
         // Prefer real Dolby-style carriage: EMDF in an audio-block skip field (mid-frame). Fall
         // back to tail auxdata if a frame's audio blocks are outside the walker's supported subset
         // or the payload exceeds the 9-bit skipl limit.
-        let injected = match eac3::inject_frame_skipfield(frame, f, &addbsi, &payload, 2) {
-            Some(out) => {
-                skipfield_frames += 1;
-                out
+        let injected = match signer {
+            Some(signer) => {
+                match eac3::inject_frame_skipfield_signed(frame, f, &addbsi, &payload, 2, signer) {
+                    Ok(Some(out)) => {
+                        skipfield_frames += 1;
+                        out
+                    }
+                    Ok(None) => {
+                        aux_frames += 1;
+                        return Err(std::io::Error::other(format!(
+                            "frame {i}: skip-field carriage is outside the walker subset; \
+                         cannot emit a signed aux-carried frame"
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(std::io::Error::other(format!(
+                            "frame {i}: EMDF frame signing failed: {e}"
+                        )));
+                    }
+                }
             }
-            None => {
-                aux_frames += 1;
-                eac3::inject_frame_full(frame, f, &addbsi, &payload, payload.len() * 8)
-            }
+            None => match eac3::inject_frame_skipfield(frame, f, &addbsi, &payload, 2) {
+                Some(out) => {
+                    skipfield_frames += 1;
+                    out
+                }
+                None => {
+                    aux_frames += 1;
+                    eac3::inject_frame_full(frame, f, &addbsi, &payload, payload.len() * 8)
+                }
+            },
         };
         // Self-verify this frame: read the addbsi flag, OAMD and JOC back. The EMDF is bit-scanned
         // anywhere in the frame (skip-field carriage is not byte-aligned).

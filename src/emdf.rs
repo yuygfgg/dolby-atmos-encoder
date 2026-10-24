@@ -328,11 +328,10 @@ fn write_var_max4(w: &mut BitWriter, value: u32) {
 // computes or validates it; Dolby-certified hardware does. We proved empirically that no public CRC
 // reproduces Dolby's values (see `verify_emdf_protection` + the brute-force documented in README).
 //
-// This trait is the ONE seam where a real signer plugs in. The default `PublicCrcProtector` keeps
-// the historical behaviour (well-formed but unsigned). A `KeyedProtector` signs with a supplied key
-// via `dolby_keyed_mac` — which today is a structurally-valid stand-in, because Dolby's actual
-// construction is undocumented. The day someone supplies BOTH a valid key AND that construction,
-// only `dolby_keyed_mac` changes; the rest of the pipeline already carries the field end-to-end.
+// The real protection is computed after injection by `sign_frame_with_key` below, because it
+// authenticates the complete E-AC-3 frame, not just the container. The `EmdfProtector` trait remains
+// the container-level placeholder used while building the EMDF; a configured `KeyedProtector` also
+// installs the post-injection frame signer, which overwrites both fields in the final frame.
 
 /// Protection-length selector → field width in bits. Index 0 ("reserved" for primary) treated as 0.
 pub const PROT_LEN: [u32; 4] = [0, 8, 32, 128];
@@ -370,8 +369,9 @@ impl EmdfProtector for PublicCrcProtector {
     }
 }
 
-/// Keyed protector: signs the EMDF via `dolby_keyed_mac` using a supplied key. Selected from the CLI
-/// (`--emdf-key` / `DOLBY_EMDF_KEY`). See `dolby_keyed_mac` for the (undocumented) construction caveat.
+/// Keyed protector. The container-level methods write a deterministic placeholder and the
+/// `key_id`/length fields; [`KeyedProtector::sign_frame`] computes the real primary/secondary over
+/// the complete injected frame. Selected from the CLI (`--emdf-key` / `DOLBY_EMDF_KEY`).
 pub struct KeyedProtector {
     pub key: Vec<u8>,
     pub key_id: u8,
@@ -389,13 +389,198 @@ impl EmdfProtector for KeyedProtector {
     }
 }
 
-/// THE proprietary seam. Dolby's EMDF protection is a keyed MAC whose algorithm is not public
-/// (ETSI TS 102 366 H.2.2.4: "implementation dependent and is not defined"). This stand-in computes
-/// HMAC-SHA256 over `key_id || covered_bytes` and truncates to the top `out_bits` bits — a real
-/// keyed MAC structurally, but it will NOT match Dolby's signature unless/until the exact
-/// construction (covered region, MAC, byte/bit ordering, truncation, per-`key_id` handling) is
-/// implemented here. Replace the body of this function — and only this function — to make signed
-/// output valid on certified hardware.
+impl KeyedProtector {
+    /// Sign one complete E-AC-3 frame after EMDF injection.
+    ///
+    /// `emdf_start_bit` is the bit offset of the EMDF sync inside `frame`; `emdf` is the same
+    /// container byte-aligned, and `excluded` lists the bit ranges (start inclusive, end
+    /// exclusive) that are not authenticated (frame header, info_metadata, addbsi, skip fields,
+    /// and the frame tail). The rule is the one used by Dolby streams:
+    ///
+    /// `primary = HMAC-SHA256(key, authenticated_core || blanked_container)[0..4]`
+    ///
+    /// `secondary = HMAC-SHA256(key, full_primary_digest)[0]`
+    ///
+    /// The container's 40 protection bits are zeroed before hashing. The frame CRC2 is recomputed
+    /// afterwards.
+    pub fn sign_frame(
+        &self,
+        frame: &mut [u8],
+        emdf_start_bit: usize,
+        emdf: &[u8],
+        excluded: &[(usize, usize)],
+    ) -> Result<(), String> {
+        sign_frame_with_key(
+            frame,
+            emdf_start_bit,
+            emdf,
+            excluded,
+            &self.key,
+            self.key_id,
+        )
+    }
+}
+
+fn merge_excluded(ranges: &[(usize, usize)], total: usize) -> Vec<(usize, usize)> {
+    let mut r: Vec<(usize, usize)> = ranges
+        .iter()
+        .copied()
+        .filter(|&(a, b)| a < b && a < total)
+        .map(|(a, b)| (a, b.min(total)))
+        .collect();
+    r.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(r.len());
+    for (a, b) in r {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+}
+
+#[inline]
+fn frame_bit(frame: &[u8], bit: usize) -> u32 {
+    u32::from((frame[bit >> 3] >> (7 - (bit & 7))) & 1)
+}
+
+#[inline]
+fn set_frame_bit(frame: &mut [u8], bit: usize, value: u32) {
+    let mask = 1u8 << (7 - (bit & 7));
+    if value & 1 == 1 {
+        frame[bit >> 3] |= mask;
+    } else {
+        frame[bit >> 3] &= !mask;
+    }
+}
+
+fn zero_frame_bits(frame: &mut [u8], bit: usize, n: usize) {
+    for p in bit..bit + n {
+        set_frame_bit(frame, p, 0);
+    }
+}
+
+/// The authenticated core of a frame: every bit not covered by `excluded`, packed MSB-first and
+/// padded to the nearest 16-bit word (halves up), matching the Dolby protection rule.
+pub fn authenticated_core(frame: &[u8], excluded: &[(usize, usize)]) -> Vec<u8> {
+    let total = frame.len() * 8;
+    let ranges = merge_excluded(excluded, total);
+    let mut w = BitWriter::new();
+    let mut next = 0usize;
+    for (a, b) in ranges {
+        if a > next {
+            for p in next..a {
+                w.bit(frame_bit(frame, p));
+            }
+        }
+        next = next.max(b);
+    }
+    if next < total {
+        for p in next..total {
+            w.bit(frame_bit(frame, p));
+        }
+    }
+    let kept = w.bit_len();
+    let mut out = w.into_bytes();
+    out.resize((kept + 8) / 16 * 2, 0);
+    out
+}
+
+/// Sign one complete E-AC-3 frame with the full EMDF protection rule.
+pub fn sign_frame_with_key(
+    frame: &mut [u8],
+    emdf_start_bit: usize,
+    emdf: &[u8],
+    excluded: &[(usize, usize)],
+    key: &[u8],
+    key_id: u8,
+) -> Result<(), String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    if key.is_empty() {
+        return Err("empty EMDF key".into());
+    }
+    if emdf.len() < 4 {
+        return Err("short EMDF container".into());
+    }
+    let length_bytes = (usize::from(emdf[2]) << 8) | usize::from(emdf[3]);
+    if emdf.len() < 4 + length_bytes {
+        return Err("truncated EMDF container body".into());
+    }
+    let offsets = field_offsets(emdf).ok_or("malformed EMDF container")?;
+    if offsets.prim_bits != 32 || offsets.sec_bits != 8 {
+        return Err(format!(
+            "unsupported protection lengths: primary={} secondary={}",
+            offsets.prim_bits, offsets.sec_bits
+        ));
+    }
+    let stored_key_id = (0..3).fold(0u8, |v, i| {
+        (v << 1) | frame_bit(emdf, offsets.key_id_bit + i) as u8
+    });
+    if stored_key_id != key_id & 7 {
+        return Err(format!(
+            "EMDF key_id {stored_key_id} does not match signing key_id {}",
+            key_id & 7
+        ));
+    }
+    let body_off = offsets
+        .protection_start
+        .checked_sub(32)
+        .ok_or("protection starts before the EMDF body")?;
+    if body_off + 40 > length_bytes * 8 {
+        return Err("protection bits lie outside the EMDF body".into());
+    }
+    let emdf_end = emdf_start_bit + emdf.len() * 8;
+    if !excluded
+        .iter()
+        .any(|&(a, b)| a <= emdf_start_bit && b >= emdf_end)
+    {
+        return Err("EMDF carrier is not excluded from the authenticated core".into());
+    }
+
+    let core = authenticated_core(frame, excluded);
+    let mut body = emdf[4..4 + length_bytes].to_vec();
+    zero_frame_bits(&mut body, body_off, 40);
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| e.to_string())?;
+    mac.update(&core);
+    mac.update(&body);
+    let primary = mac.finalize().into_bytes();
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| e.to_string())?;
+    mac.update(&primary);
+    let secondary = mac.finalize().into_bytes();
+
+    let protection = emdf_start_bit + offsets.protection_start;
+    for i in 0..32 {
+        set_frame_bit(
+            frame,
+            protection + i,
+            u32::from((primary[i >> 3] >> (7 - (i & 7))) & 1),
+        );
+    }
+    for i in 0..8 {
+        set_frame_bit(
+            frame,
+            protection + 32 + i,
+            u32::from((secondary[0] >> (7 - i)) & 1),
+        );
+    }
+
+    let n = frame.len();
+    if n < 4 {
+        return Err("short E-AC-3 frame".into());
+    }
+    // E-AC-3 does not invert encinfo/crcrsv when CRC2 equals the sync word (unlike AC-3).
+    let crc = crate::eac3::crc16(&frame[2..n - 2]);
+    frame[n - 2] = (crc >> 8) as u8;
+    frame[n - 1] = crc as u8;
+    Ok(())
+}
+
+/// Container-level placeholder for the pre-injection EMDF body. This is not the Dolby frame
+/// protection; `sign_frame_with_key` computes that over the complete injected frame. Kept so
+/// unsigned and diagnostic paths still emit a deterministic, structurally valid field.
 fn dolby_keyed_mac(key: &[u8], key_id: u8, covered: &[u8], nbits: usize, out_bits: u32) -> u128 {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -415,9 +600,24 @@ fn dolby_keyed_mac(key: &[u8], key_id: u8, covered: &[u8], nbits: usize, out_bit
 static PROTECTOR: OnceLock<Box<dyn EmdfProtector>> = OnceLock::new();
 static FALLBACK_PROTECTOR: PublicCrcProtector = PublicCrcProtector;
 
+/// Full frame signer (process-global), installed alongside the container-level placeholder when a
+/// key is configured. It is applied after EMDF injection because the real protection covers the
+/// E-AC-3 frame, not only the container.
+static FRAME_SIGNER: OnceLock<KeyedProtector> = OnceLock::new();
+
 /// Install the active EMDF protector. Call once, early in `main`. No-op if already set.
 pub fn set_protector(p: Box<dyn EmdfProtector>) {
     let _ = PROTECTOR.set(p);
+}
+
+/// Install the post-injection frame signer. Call once, early in `main`.
+pub fn set_frame_signer(p: KeyedProtector) {
+    let _ = FRAME_SIGNER.set(p);
+}
+
+/// The post-injection frame signer, when a key was configured.
+pub fn frame_signer() -> Option<&'static KeyedProtector> {
+    FRAME_SIGNER.get()
 }
 
 fn active_protector() -> &'static dyn EmdfProtector {
@@ -1414,5 +1614,95 @@ mod tests {
         let (pc, sc) = PublicCrcProtector.length_codes();
         assert_eq!(PROT_LEN[pc as usize], 32);
         assert_eq!(PROT_LEN[sc as usize], 8);
+    }
+
+    #[test]
+    fn authenticated_core_matches_dolby_word_rounding() {
+        let frame = [0xffu8; 4];
+        // 23 kept bits round down to one 16-bit word; 24 kept bits round up to two.
+        assert_eq!(authenticated_core(&frame, &[(0, 9)]), vec![0xff, 0xff]);
+        assert_eq!(
+            authenticated_core(&frame, &[(0, 8)]),
+            vec![0xff, 0xff, 0xff, 0x00]
+        );
+    }
+
+    fn signing_fixture() -> (Vec<u8>, Vec<u8>, Vec<(usize, usize)>) {
+        let payloads = vec![(
+            PAYLOAD_OAMD,
+            encode_oamd(
+                &[ObjectPos {
+                    x: 0.25,
+                    y: -0.5,
+                    z: 0.75,
+                }],
+                true,
+            ),
+        )];
+        let emdf = wrap_emdf_with(&payloads, &PublicCrcProtector);
+        let mut frame: Vec<u8> = (0..emdf.len() + 24).map(|i| (i * 37 + 11) as u8).collect();
+        let start = 37usize;
+        for i in 0..emdf.len() * 8 {
+            set_frame_bit(&mut frame, start + i, frame_bit(&emdf, i));
+        }
+        let end = start + emdf.len() * 8;
+        let total = frame.len() * 8;
+        let excluded = vec![(0, 32), (start, end), (total - 20, total)];
+        (frame, emdf, excluded)
+    }
+
+    fn protection_bytes(frame: &[u8], emdf: &[u8], start: usize) -> [u8; 5] {
+        let offsets = field_offsets(emdf).expect("container");
+        let mut out = [0u8; 5];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = (0..8).fold(0u8, |v, j| {
+                (v << 1) | frame_bit(frame, start + offsets.protection_start + 8 * i + j) as u8
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn frame_signing_is_deterministic_and_key_sensitive() {
+        let (frame, emdf, excluded) = signing_fixture();
+        let start = 37usize;
+        let key = [0x42u8; 32];
+
+        let mut a = frame.clone();
+        sign_frame_with_key(&mut a, start, &emdf, &excluded, &key, 0).unwrap();
+        let mut b = frame.clone();
+        sign_frame_with_key(&mut b, start, &emdf, &excluded, &key, 0).unwrap();
+        assert_eq!(a, b, "same key must produce the same frame");
+        assert_eq!(crate::eac3::crc16(&a[2..]), 0, "crc2 must verify");
+        let sig = protection_bytes(&a, &emdf, start);
+
+        let mut c = frame.clone();
+        sign_frame_with_key(&mut c, start, &emdf, &excluded, &[0x24u8; 32], 0).unwrap();
+        assert_ne!(sig, protection_bytes(&c, &emdf, start));
+
+        let mut d = frame.clone();
+        // Flip authenticated data between the frame header and the EMDF carrier.
+        let flipped = frame_bit(&d, 33) ^ 1;
+        set_frame_bit(&mut d, 33, flipped);
+        sign_frame_with_key(&mut d, start, &emdf, &excluded, &key, 0).unwrap();
+        assert_ne!(sig, protection_bytes(&d, &emdf, start));
+    }
+
+    #[test]
+    fn frame_signing_rejects_uncovered_container_and_wrong_key_id() {
+        let (frame, emdf, excluded) = signing_fixture();
+        let start = 37usize;
+        let key = [0x42u8; 32];
+
+        let mut no_carrier = frame.clone();
+        let mut uncovered = excluded.clone();
+        uncovered.retain(|&(a, b)| !(a <= start && b >= start + emdf.len() * 8));
+        assert!(sign_frame_with_key(&mut no_carrier, start, &emdf, &uncovered, &key, 0).is_err());
+
+        let mut wrong_id = frame;
+        let mut wrong = emdf.clone();
+        // key_id is the 3-bit field at bit 34 of the container.
+        set_frame_bit(&mut wrong, 34, 1);
+        assert!(sign_frame_with_key(&mut wrong_id, start, &wrong, &excluded, &key, 0).is_err());
     }
 }

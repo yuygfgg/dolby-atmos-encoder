@@ -511,14 +511,16 @@ pub fn bsi_dump(frame: &[u8], info: &FrameInfo) {
 }
 
 /// Locate the `infomdate` flag bit (start of `info_metadata()`) by walking bsi() up to that point.
-/// Returns `(bit_index_of_infomdate, infomdate_value)`. Independent E-AC-3 (strmtyp 0) only.
-fn bsi_infomdate_pos(frame: &[u8], info: &FrameInfo) -> Option<(usize, u32)> {
+/// Returns `(bit_index_of_infomdate, infomdate_value, end_bit_of_info_metadata)`.
+/// Independent E-AC-3 (strmtyp 0) only.
+fn bsi_infomdate_pos(frame: &[u8], info: &FrameInfo) -> Option<(usize, u32, usize)> {
     if info.bsid != 16 {
         return None;
     }
     let cm = info.acmod as u32;
     let lfe = info.lfe;
     let blocks = info.blocks as u32;
+    let fscod = info.fscod as u32;
     let strmtyp = info.strmtyp;
 
     let mut r = BitReader::new(frame, 0);
@@ -600,7 +602,37 @@ fn bsi_infomdate_pos(frame: &[u8], info: &FrameInfo) -> Option<(usize, u32)> {
     }
     let q = r.pos;
     let infomdate = r.read(1);
-    Some((q, infomdate))
+    if infomdate == 1 {
+        r.read(3); // bsmod
+        r.read(1); // copyrightb
+        r.read(1); // origbs
+        if cm == 2 {
+            r.read(2); // dsurmod
+            r.read(2); // dheadphonmod
+        } else if cm >= 6 {
+            r.read(2); // dsurexmod
+        }
+        if r.read(1) == 1 {
+            r.read(5); // mixlevel
+            r.read(2); // roomtyp
+            r.read(1); // adconvtyp
+        }
+        if cm == 0 && r.read(1) == 1 {
+            r.read(5); // mixlevel2
+            r.read(2); // roomtyp2
+            r.read(1); // adconvtyp2
+        }
+        if fscod < 3 {
+            r.read(1); // sourcefscod
+        }
+    }
+    Some((q, infomdate, r.pos))
+}
+
+/// Bit range (start inclusive, end exclusive) of `infomdate` through `sourcefscod`.
+fn bsi_info_range(frame: &[u8], info: &FrameInfo) -> Option<(usize, usize)> {
+    let (start, present, end) = bsi_infomdate_pos(frame, info)?;
+    (present == 1).then_some((start, end))
 }
 
 /// Locate the `addbsie` flag bit in an E-AC-3 syncframe by walking `bsi()` (ATSC A/52 Annex E,
@@ -787,6 +819,13 @@ pub fn inject_frame_full(
     out
 }
 
+/// Bit ranges excluded from the EMDF-authenticated core (start inclusive, end exclusive), plus the
+/// absolute bit offset of the EMDF sync in the injected frame.
+struct SignInfo {
+    excluded: Vec<(usize, usize)>,
+    emdf_start_bit: usize,
+}
+
 /// Inject the addbsi Atmos flag (FRONT, in bsi) **and** carry the EMDF in an audio-block **skip
 /// field** (mid-frame) — the way real Dolby DD+ JOC streams do it. This enables
 /// `skipFieldSyntaxEnabled` in audfrm and writes a `skiple` flag at every block's skip-field point
@@ -802,6 +841,35 @@ pub fn inject_frame_skipfield(
     emdf: &[u8],
     target_block: usize,
 ) -> Option<Vec<u8>> {
+    inject_frame_skipfield_inner(frame, info, addbsi, emdf, target_block).map(|(frame, _)| frame)
+}
+
+/// Like [`inject_frame_skipfield`], then apply the full EMDF frame protection with `signer`.
+/// `Ok(None)` means the frame is outside the skip-field subset; `Err` means signing failed.
+pub fn inject_frame_skipfield_signed(
+    frame: &[u8],
+    info: &FrameInfo,
+    addbsi: &[u8],
+    emdf: &[u8],
+    target_block: usize,
+    signer: &crate::emdf::KeyedProtector,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some((mut out, sign)) =
+        inject_frame_skipfield_inner(frame, info, addbsi, emdf, target_block)
+    else {
+        return Ok(None);
+    };
+    signer.sign_frame(&mut out, sign.emdf_start_bit, emdf, &sign.excluded)?;
+    Ok(Some(out))
+}
+
+fn inject_frame_skipfield_inner(
+    frame: &[u8],
+    info: &FrameInfo,
+    addbsi: &[u8],
+    emdf: &[u8],
+    target_block: usize,
+) -> Option<(Vec<u8>, SignInfo)> {
     if emdf.len() > 511 {
         return None; // skipl (9 bits) cannot represent it; caller falls back to auxdata
     }
@@ -812,7 +880,7 @@ pub fn inject_frame_skipfield(
     }
     let bsi_end = p + 1; // audfrm start (addbsie == 0)
     let skipfld_bit = crate::eac3_audblk::skipfld_enable_bit(frame, info, bsi_end)?;
-    let (points, _end) = crate::eac3_audblk::skip_points(frame, info, bsi_end)?;
+    let (points, core_end) = crate::eac3_audblk::skip_points(frame, info, bsi_end)?;
     if points.len() != 6 || target_block >= 6 {
         return None;
     }
@@ -825,9 +893,12 @@ pub fn inject_frame_skipfield(
     // infomdate=1), synthesize an all-zero info_metadata() so the bsi matches a Dolby-authored core.
     // The 9-bit body (bsmod3·copyright1·original1·dsurexmod2·audprodie1·sourcefscod1) is valid only
     // for acmod 7 @ fscod<3 — exactly our 5.1 core config.
-    let (info_pos, info_val) = bsi_infomdate_pos(frame, info)?;
+    let (info_pos, info_val, _) = bsi_infomdate_pos(frame, info)?;
     let insert_info = info_val == 0 && info.acmod == 7 && info.fscod < 3 && info_pos < p;
     let info_extra = if insert_info { 9 } else { 0 };
+
+    let mut excluded = vec![(0usize, 32usize)];
+    let mut emdf_start_bit = 0usize;
 
     let addbsi_bits = addbsi.len() * 8;
     let emdf_bits = emdf.len() * 8;
@@ -859,36 +930,50 @@ pub fn inject_frame_skipfield(
     if insert_info {
         // [0, info_pos): bsi up to the infomdate flag, frmsiz patched.
         w.copy_bits(&fr, info_pos);
+        let start = w.bits_written();
         w.bit(1); // infomdate = 1
         w.write(0, 9); // info_metadata() body, all zero (matches Dolby Atmos core)
+        excluded.push((start, w.bits_written()));
         // (info_pos+1, p): bits between old infomdate flag and addbsie (e.g. convsync; empty here).
         w.copy_bits_from(&fr, info_pos + 1, p - (info_pos + 1));
     } else {
+        if let Some(range) = bsi_info_range(frame, info) {
+            excluded.push(range);
+        }
         // [0, p): sync + bsi up to (not incl.) addbsie, frmsiz patched.
         w.copy_bits(&fr, p);
     }
     // addbsi field (addbsie=1, addbsil, bytes).
+    let addbsi_start = w.bits_written();
     w.bit(1);
     w.write(addbsi.len() as u32 - 1, 6);
     w.copy_bits(addbsi, addbsi_bits);
+    excluded.push((addbsi_start, w.bits_written()));
     // (p+1, skipfld_bit): rest of bsi + audfrm up to the skip-field-enable flag.
     w.copy_bits_from(frame, p + 1, skipfld_bit - (p + 1));
     // skipFieldSyntaxEnabled = 1 (replaces the original 0 bit).
+    let skipflde_start = w.bits_written();
     w.bit(1);
+    excluded.push((skipflde_start, skipflde_start + 1));
     // (skipfld_bit+1, points[0]): rest of audfrm + start of block 0.
     w.copy_bits_from(frame, skipfld_bit + 1, points[0] - (skipfld_bit + 1));
     // Each block's skip field, then the block body up to the next skip point.
     for b in 0..6 {
+        let skip_start = w.bits_written();
         if b == target_block {
             w.bit(1); // skiple = 1
             w.write(emdf.len() as u32, 9); // skipl (bytes)
             w.copy_bits(emdf, emdf_bits);
+            emdf_start_bit = skip_start + 10;
         } else {
             w.bit(0); // skiple = 0
         }
+        excluded.push((skip_start, w.bits_written()));
         let seg_end = if b + 1 < 6 { points[b + 1] } else { l - 18 };
         w.copy_bits_from(frame, points[b], seg_end - points[b]);
     }
+    let copied_padding = (l - 18).saturating_sub(core_end);
+    let audio_end = w.bits_written() - copied_padding;
     // Tail: padding, then auxdatae=0, crcrsv=0, crc2.
     for _ in 0..gap {
         w.bit(0);
@@ -900,7 +985,14 @@ pub fn inject_frame_skipfield(
     w.write(crc as u32, 16);
     let out = w.finish();
     debug_assert_eq!(out.len(), ns);
-    Some(out)
+    excluded.push((audio_end, ns * 8));
+    Some((
+        out,
+        SignInfo {
+            excluded,
+            emdf_start_bit,
+        },
+    ))
 }
 
 /// Definitive-test surgery: replace a REAL Dolby core's native EMDF (in its skip field) with our

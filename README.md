@@ -57,7 +57,7 @@ cargo build --release
 
 (Stand-alone crate — it does **not** depend on the `truehdd` library; it consumes the DAMF files
 `truehdd` produces. The only codec-specific dependency is `rustfft`, used by the per-band JOC
-analysis; `hmac`/`sha2` implement the EMDF signing seam.)
+analysis; `hmac`/`sha2` implement the in-process EMDF frame protection.)
 
 ### Memory use (large files)
 
@@ -106,9 +106,10 @@ dolby-atmos-encoder downmix master.atmos --out - --surround-phase-shift \
 #    (Short clips only — `--out downmix.wav` then `ffmpeg -i downmix.wav ...` — but a 5.1
 #     32-bit-float WAV is capped at 4 GB, i.e. ~58 min at 48 kHz, so prefer the pipe above.)
 
-# 4. Inject per-frame Atmos metadata (OAMD + JOC + the addbsi detection flag) into the core.
-dolby-atmos-encoder atmos core.eac3 master.atmos --out atmos.eac3 --surround-phase-shift
-#    (add  --emdf-key <hex>  to sign the EMDF protection field — see "The signing seam")
+# 4. Inject per-frame Atmos metadata (OAMD + JOC + the addbsi detection flag) and sign in-process.
+dolby-atmos-encoder --emdf-key @emdf_keys.bin \
+  atmos core.eac3 master.atmos --out atmos.eac3 --surround-phase-shift
+#    (--emdf-key accepts hex, @hex-file, or @ddpmeta-binary-key-set; see "The signing seam")
 #    (drop --surround-phase-shift from BOTH commands for the old flag-0, unshifted core)
 
 # 5. Mux into an MKV alongside your video.
@@ -129,7 +130,7 @@ Run `--help` on each for details.
 |---|---|
 | `inspect <atmos>` | Report a DAMF master's bed/object layout and metadata. |
 | `downmix <atmos> --out d.wav [--surround-phase-shift]` | Render objects to a 5.1 bed WAV (`--out -` streams raw f32le to stdout — no 4 GB cap, pipe into ffmpeg). The optional +90° Ls/Rs all-pass matches DME. |
-| `atmos <core> <atmos> --out o.eac3 [--surround-phase-shift]` | Inject OAMD+JOC metadata + the addbsi flag into an E-AC-3 core. With the flag, write `joc_dmx_config_idx=3` (pair it with a `downmix --surround-phase-shift` core). |
+| `atmos <core> <atmos> --out o.eac3 [--surround-phase-shift]` | Inject OAMD+JOC metadata + the addbsi flag into an E-AC-3 core. With `--emdf-key`, sign the full frame in-process. With the phase flag, write `joc_dmx_config_idx=3` (pair it with a `downmix --surround-phase-shift` core). |
 | `oamd <core> <atmos> --out o.eac3` | OAMD only (no JOC). |
 | `coregraft <realcore> <myatmos> --out o.eac3` | Splice our metadata onto a real Dolby core (diagnostic). |
 | `graft <core> <reference> --out o.eac3` | Splice Dolby's metadata onto our core (diagnostic). |
@@ -137,8 +138,8 @@ Run `--help` on each for details.
 | `oamddump <hex>` | Verbose field-by-field OAMD decode. |
 | `emdfverify <input>` | Check whether our protection CRC matches a stream's stored `emdf_protection`. |
 
-Global: `--emdf-key <hex|@file>` and `--emdf-key-id <0..7>` (or `DOLBY_EMDF_KEY`) — see
-[The signing seam](#the-signing-seam---emdf-key).
+Global: `--emdf-key <hex|@hex-file|@binary-key-set>` and `--emdf-key-id <0..7>` (or
+`DOLBY_EMDF_KEY`) — see [The signing seam](#the-signing-seam---emdf-key).
 
 ## Verifying with Cavern
 
@@ -211,7 +212,7 @@ Surround on real hardware:
 itself** is rejected even with perfect metadata. ffmpeg's E-AC-3 encoder is not Dolby-grade (e.g. it
 does no channel coupling); there is no open-source Dolby-conformant E-AC-3 core encoder.
 
-### Wall 2 — EMDF keyed authentication (the decisive one)
+### Wall 2 — EMDF keyed authentication
 `coregraft` = **a real Dolby core + our metadata** → Dolby Surround. The metadata is rejected too,
 and we traced it to the EMDF `emdf_protection` field, which is a **keyed authentication code**, not
 a computable checksum:
@@ -221,44 +222,47 @@ a computable checksum:
    key** used to calculate the value of the `protection_bits_primary` and `protection_bits_secondary`
    fields," and that calculation is "**implementation dependent and is not defined in the present
    document**."
-2. **Brute force confirms it.** `emdfverify` dumps each real frame's protection bits; an offline
-   sweep of **all 256 CRC-8 polynomials × every init/xorout/reflection over 7 candidate
-   byte-regions across 8 real Dolby frames found ZERO matches**, and no standard CRC-32 variant
-   matched the 32-bit primary. The null result is the signature of a real secret key.
-3. **No open decoder computes it.** `truehdd` marks the field `// TODO: HMAC`; Cavern and ffmpeg
-   don't validate it at all. Only Dolby's licensed encoder (holding the key) can produce valid
-   protection bits; certified hardware validates them.
+2. **No public CRC matches.** `emdfverify` dumps each real frame's protection bits; an offline sweep
+   of all 256 CRC-8 polynomials × every init/xorout/reflection over 7 candidate byte-regions across
+   8 real Dolby frames found zero matches, and no standard CRC-32 variant matched the primary.
+3. **The rule was reconstructed and is implemented in-process.** It is a keyed HMAC over the
+   authenticated E-AC-3 frame plus the blanked EMDF container; see
+   [The signing seam](#the-signing-seam---emdf-key). With a valid key, our primary/secondary values
+   match `ddpmeta resign` byte-for-byte.
 
-**Conclusion:** an open-source encoder that produces *hardware-conformant* DD+ JOC Atmos is not
-achievable. The audio coding is solved; the format gates playback behind a proprietary cryptographic
-signature by design.
+**Conclusion:** the protection algorithm is no longer the blocker when a valid key is available.
+A from-scratch file still hits **Wall 1** (the core encoder); the `coregraft` path — our metadata on
+a *real* Dolby core — is the one that can pass both walls. This project does not ship or recover any
+Dolby key.
 
 ---
 
 ## The signing seam (`--emdf-key`)
 
-All of the proprietary cryptography is isolated behind **one trait**, `emdf::EmdfProtector`, with one
-real implementation point, `emdf::dolby_keyed_mac`:
+The EMDF protection is now computed **in-process, after injection**, over the complete E-AC-3
+frame:
 
-- **`PublicCrcProtector`** (default) — public CRC-32 / CRC-8. Well-formed but **unsigned**; this is
-  the historical behaviour and what you get with no key.
-- **`KeyedProtector`** — selected by `--emdf-key <hex>` (or `DOLBY_EMDF_KEY`). Routes to
-  `dolby_keyed_mac`, currently an **HMAC-SHA256 stand-in** that proves the wiring end-to-end.
+- `primary = HMAC-SHA256(key, authenticated_core || blanked_emdf_container)[0..4]`
+- `secondary = HMAC-SHA256(key, full_32_byte_primary_digest)[0]`
 
-To produce a signature real hardware accepts you need **both**, and even then a caveat:
+The authenticated core excludes the frame header, `info_metadata`, `addbsi`, `skipflde`, every
+block's skip field, and the frame tail; the EMDF container's 40 protection bits are zeroed before
+hashing. The frame CRC2 is recomputed afterwards. This is the rule used by real Dolby streams and
+by `ddpmeta resign`; on the 16-channel test master the output is **byte-for-byte identical** to
+`ddpmeta resign`, and running `ddpmeta resign` on our signed output is a no-op.
 
-1. a valid Dolby authentication key for the correct `key_id`, **and**
-2. Dolby's **actual** keyed-MAC construction — exact covered byte-range, MAC algorithm, bit/byte
-   ordering, truncation, per-`key_id` handling — implemented in `dolby_keyed_mac`. This is
-   undocumented (the spec explicitly declines to define it). **A key alone is not sufficient:** we
-   know the container *structure* (32-bit primary + 8-bit secondary + 3-bit `key_id`) but not the
-   algorithm or which bytes it covers (our CRCs over the obvious regions do not match Dolby).
-3. …and a valid signature still does **not** defeat **Wall 1** for a from-scratch file — only the
-   `coregraft` path (our metadata on a *real* Dolby core) could benefit.
+- **`PublicCrcProtector`** (default, no key) — public CRC-32 / CRC-8 placeholder. Well-formed but
+  **unsigned**; ffmpeg/Cavern decode it, strict Dolby validation rejects it.
+- **`KeyedProtector`** — selected by `--emdf-key` (or `DOLBY_EMDF_KEY`). The container-level
+  `EmdfProtector` writes the `key_id`/length fields and a placeholder; `KeyedProtector::sign_frame`
+  then overwrites both protection fields using the full-frame rule above. `--emdf-key` accepts raw
+  hex, `@path` to a hex file, or `@path` to a `ddpmeta` binary key set; `--emdf-key-id` selects the
+  entry.
 
-> This project does **not** contain, ship, or attempt to recover any Dolby key, and it cannot
-> reverse a secure keyed MAC from output samples (that is the security guarantee of a MAC). The seam
-> exists for completeness and research. Producing conformant Atmos requires Dolby's licensed encoder.
+A valid authentication key is still required — the project does not ship or recover keys. With a
+valid key, the protection is reproducible; **Wall 1** (the core encoder) still applies to a
+from-scratch file, while the `coregraft` path (our metadata on a real Dolby core) is the one that
+can benefit from valid protection.
 
 ---
 
@@ -284,7 +288,7 @@ src/
   main.rs          CLI + command dispatch (clap)
   damf.rs          DAMF (.atmos/.audio/.metadata) reader
   render.rs        Atmos objects -> 5.1 bed (VBAP)
-  emdf.rs          EMDF container, OAMD encode/decode, the EmdfProtector signing seam
+  emdf.rs          EMDF container, OAMD encode/decode, full-frame EMDF protection
   joc.rs           Joint Object Coding matrix solve + payload writer
   joc_analysis.rs  Streaming per-band covariance analysis (rustfft bank over the DAMF essence)
   joc_tables.rs    JOC quant / Huffman tables
