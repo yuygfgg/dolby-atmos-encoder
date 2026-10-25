@@ -26,17 +26,38 @@ const RING: [(f64, usize); 5] = [
     (110.0, 4),  // Rs
 ];
 
-/// Downmix panning law. `Vbap` is the original constant-power pairwise spread; `Hard` mimics
-/// DME's static-object downmix: nearest 5.1 speaker, with a height trim (front −3 dB, surround
-/// −0.5 dB) and an Ls/Rs tie at the rear centre.
+/// Downmix panning law. `Vbap` is the original constant-power pairwise spread. `Hard51` is the
+/// 5.1 nearest-speaker pan, with a height trim (front −3 dB, surround −0.5 dB) and an Ls/Rs
+/// tie at the rear centre. `Hard71` renders the object to a 7.1 ring and folds  `Lrs`/`Rrs`
+/// into `Ls`/`Rs`, matching the 6ch presentation's 7.1 fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum PanMode {
     Vbap,
-    Hard,
+    #[value(name = "hard51")]
+    Hard51,
+    #[value(name = "hard71")]
+    Hard71,
 }
 
 const FRONT_HEIGHT_TRIM: f32 = 0.707_945_8; // -3.0 dB
 const SURROUND_HEIGHT_TRIM: f32 = 0.944_060_9; // -0.5 dB
+
+/// 7.1 speaker ring as (azimuth degrees, index into the 7-channel gain array
+/// `[L,R,C,Ls,Rs,Lrs,Rrs]`). `Lrs`/`Rrs` are folded into the 5.1 `Ls`/`Rs` output.
+const RING71: [(f64, usize); 7] = [
+    (-150.0, 5), // Lrs
+    (-90.0, 3),  // Ls
+    (-30.0, 0),  // L
+    (0.0, 2),    // C
+    (30.0, 1),   // R
+    (90.0, 4),   // Rs
+    (150.0, 6),  // Rrs
+];
+
+/// Per-speaker gains measured from the 16ch.mlp 7.1 presentation for static objects:
+/// fronts 0 dB, side surrounds -1.24 dB, rear surrounds -1.5 dB. Applying these before the
+/// fold keeps the 5.1 surround balance close to the 6ch presentation.
+const GAIN71: [f32; 7] = [1.0, 1.0, 1.0, 0.867, 0.867, 0.842, 0.842];
 
 /// Nearest speaker on the 5.1 ring, measured by absolute angular distance.
 fn nearest_speaker(az: f64) -> usize {
@@ -55,8 +76,8 @@ fn nearest_speaker(az: f64) -> usize {
     best
 }
 
-/// DME-style hard pan: one core speaker per object, except the rear-centre tie (Ls+Rs).
-pub(crate) fn pan_hard(x: f64, y: f64, z: f64) -> [f32; 5] {
+/// Legacy 5.1 hard pan: one core speaker per object, except the rear-centre tie (Ls+Rs).
+pub(crate) fn pan_hard51(x: f64, y: f64, z: f64) -> [f32; 5] {
     let mut g = [0.0f32; 5];
     if x.abs() < 1e-9 && y <= 0.0 {
         g[3] = std::f32::consts::FRAC_1_SQRT_2;
@@ -76,6 +97,52 @@ pub(crate) fn pan_hard(x: f64, y: f64, z: f64) -> [f32; 5] {
         }
     }
     g
+}
+
+/// Nearest speaker on the 7.1 ring, measured by absolute angular distance.
+fn nearest_speaker71(az: f64) -> usize {
+    let mut best = 2;
+    let mut best_d = f64::INFINITY;
+    for (a, idx) in RING71 {
+        let mut d = (az - a).abs() % 360.0;
+        if d > 180.0 {
+            d = 360.0 - d;
+        }
+        if d < best_d {
+            best_d = d;
+            best = idx;
+        }
+    }
+    best
+}
+
+/// 7.1 hard pan with the measured 6ch presentation speaker gains, folded to `[L,R,C,Ls,Rs]`.
+/// Rear-centre objects tie `Lrs`/`Rrs`. Height objects keep the same front/surround trims as
+/// `pan_hard51`; the fold sums `Lrs` into `Ls` and `Rrs` into `Rs` without normalisation.
+pub(crate) fn pan_hard71(x: f64, y: f64, z: f64) -> [f32; 5] {
+    let mut g = [0.0f32; 7];
+    if x.abs() < 1e-9 && y <= 0.0 {
+        g[5] = std::f32::consts::FRAC_1_SQRT_2;
+        g[6] = std::f32::consts::FRAC_1_SQRT_2;
+    } else {
+        let az = x.atan2(y).to_degrees();
+        g[nearest_speaker71(az)] = 1.0;
+    }
+    for (v, trim) in g.iter_mut().zip(GAIN71) {
+        *v *= trim;
+    }
+    if z > 0.0 {
+        for (i, v) in g.iter_mut().enumerate() {
+            if *v != 0.0 {
+                *v *= if i < 3 {
+                    FRONT_HEIGHT_TRIM
+                } else {
+                    SURROUND_HEIGHT_TRIM
+                };
+            }
+        }
+    }
+    [g[0], g[1], g[2], g[3] + g[5], g[4] + g[6]]
 }
 
 /// Constant-power pairwise pan of an object at room position (x,y) to `[L,R,C,Ls,Rs]` gains.
@@ -168,7 +235,8 @@ pub(crate) fn gain_keyframes(
         let g = if st.1 {
             match mode {
                 PanMode::Vbap => pan_vbap(st.0[0], st.0[1]),
-                PanMode::Hard => pan_hard(st.0[0], st.0[1], st.0[2]),
+                PanMode::Hard51 => pan_hard51(st.0[0], st.0[1], st.0[2]),
+                PanMode::Hard71 => pan_hard71(st.0[0], st.0[1], st.0[2]),
             }
         } else {
             [0.0; 5]
@@ -444,8 +512,8 @@ mod tests {
     }
 
     #[test]
-    fn hard_pan_front_left_is_l_only() {
-        let g = pan_hard(-1.0, 1.0, 0.0);
+    fn hard51_pan_front_left_is_l_only() {
+        let g = pan_hard51(-1.0, 1.0, 0.0);
         assert!(approx(g[0], 1.0));
         for k in [1, 2, 3, 4] {
             assert!(approx(g[k], 0.0));
@@ -453,8 +521,8 @@ mod tests {
     }
 
     #[test]
-    fn hard_pan_front_centre_is_c_only() {
-        let g = pan_hard(0.0, 1.0, 0.0);
+    fn hard51_pan_front_centre_is_c_only() {
+        let g = pan_hard51(0.0, 1.0, 0.0);
         assert!(approx(g[2], 1.0));
         for k in [0, 1, 3, 4] {
             assert!(approx(g[k], 0.0));
@@ -462,25 +530,25 @@ mod tests {
     }
 
     #[test]
-    fn hard_pan_side_and_back_fold_to_surrounds() {
-        assert!(approx(pan_hard(-1.0, 0.0, 0.0)[3], 1.0));
-        assert!(approx(pan_hard(1.0, 0.0, 0.0)[4], 1.0));
-        assert!(approx(pan_hard(-1.0, -1.0, 0.0)[3], 1.0));
+    fn hard51_pan_side_and_back_fold_to_surrounds() {
+        assert!(approx(pan_hard51(-1.0, 0.0, 0.0)[3], 1.0));
+        assert!(approx(pan_hard51(1.0, 0.0, 0.0)[4], 1.0));
+        assert!(approx(pan_hard51(-1.0, -1.0, 0.0)[3], 1.0));
     }
 
     #[test]
-    fn hard_pan_rear_centre_ties_ls_rs() {
-        let g = pan_hard(0.0, 0.0, 0.0);
+    fn hard51_pan_rear_centre_ties_ls_rs() {
+        let g = pan_hard51(0.0, 0.0, 0.0);
         assert!(approx(g[3], std::f32::consts::FRAC_1_SQRT_2));
         assert!(approx(g[4], std::f32::consts::FRAC_1_SQRT_2));
     }
 
     #[test]
-    fn hard_pan_height_trims() {
-        assert!(approx(pan_hard(-1.0, 1.0, 1.0)[0], FRONT_HEIGHT_TRIM));
-        assert!(approx(pan_hard(0.0, 1.0, 1.0)[2], FRONT_HEIGHT_TRIM));
-        assert!(approx(pan_hard(-1.0, 0.0, 1.0)[3], SURROUND_HEIGHT_TRIM));
-        let g = pan_hard(0.0, 0.0, 1.0);
+    fn hard51_pan_height_trims() {
+        assert!(approx(pan_hard51(-1.0, 1.0, 1.0)[0], FRONT_HEIGHT_TRIM));
+        assert!(approx(pan_hard51(0.0, 1.0, 1.0)[2], FRONT_HEIGHT_TRIM));
+        assert!(approx(pan_hard51(-1.0, 0.0, 1.0)[3], SURROUND_HEIGHT_TRIM));
+        let g = pan_hard51(0.0, 0.0, 1.0);
         assert!(approx(
             g[3],
             std::f32::consts::FRAC_1_SQRT_2 * SURROUND_HEIGHT_TRIM
@@ -489,5 +557,31 @@ mod tests {
             g[4],
             std::f32::consts::FRAC_1_SQRT_2 * SURROUND_HEIGHT_TRIM
         ));
+    }
+
+    #[test]
+    fn hard71_folds_side_and_rear_surrounds() {
+        assert!(approx(pan_hard71(-1.0, 0.0, 0.0)[3], 0.867));
+        assert!(approx(pan_hard71(-1.0, -1.0, 0.0)[3], 0.842));
+        assert!(approx(pan_hard71(1.0, 0.0, 0.0)[4], 0.867));
+        assert!(approx(pan_hard71(1.0, -1.0, 0.0)[4], 0.842));
+        assert!(approx(pan_hard71(-1.0, 1.0, 0.0)[0], 1.0));
+    }
+
+    #[test]
+    fn hard71_rear_centre_ties_lrs_rrs() {
+        let g = pan_hard71(0.0, -1.0, 0.0);
+        let expected = 0.842 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(approx(g[3], expected));
+        assert!(approx(g[4], expected));
+    }
+
+    #[test]
+    fn hard71_height_trims() {
+        assert!(approx(
+            pan_hard71(-1.0, 0.0, 1.0)[3],
+            0.867 * SURROUND_HEIGHT_TRIM
+        ));
+        assert!(approx(pan_hard71(0.0, 1.0, 1.0)[2], FRONT_HEIGHT_TRIM));
     }
 }

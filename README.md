@@ -30,19 +30,21 @@ Check the master first:
 
 ### 1. Downmix to 5.1 and encode the E-AC-3 core
 
-All downmix flags are explicit below; `hard` panning and 0 dB gain are the defaults.
+All downmix flags are explicit below; `hard71` panning and 0 dB gain are the defaults.
+`--pan hard71` renders a 7.1 bed and folds `Lrs`/`Rrs` into `Ls`/`Rs`; `--pan hard51` is the
+5.1 pan, and `--pan vbap` is the constant-power spread.
 
 ```sh
 "$ENC" downmix 16ch.atmos \
     --out - \
-    --pan hard \
+    --pan hard71 \
     --gain-db 0 \
     --surround-phase-shift \
   | ffmpeg -y -hide_banner -v error \
       -f f32le -ar 48000 -channel_layout 5.1 -i pipe:0 \
       -/filter_complex lfe-lowpass.fgraph \
       -map '[out]' \
-      -c:a eac3 -b:a 693.356k \
+      -c:a eac3 -b:a 692.950k \
       -channel_coupling 0 \
       -dmix_mode loro \
       -ltrt_cmixlev 0.70710678 -loro_cmixlev 0.70710678 \
@@ -92,7 +94,7 @@ ffmpeg -hide_banner -v error -drc_scale 0 \
       --emdf-key-id 0 \
       atmos core_shift.ec3 16ch.atmos \
       --out out/16ch_joc_768k_shift.ec3 \
-      --pan hard \
+      --pan hard71 \
       --core-pcm - \
       --core-delay 256 \
       --joc-lambda 1e-3 \
@@ -115,7 +117,7 @@ Do not mix the two: flag 3 requires a genuinely shifted core.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--out PATH` | `downmix.wav` | Output. `-` = raw f32le 6ch to stdout; a path writes WAV. |
-| `--pan hard\|vbap` | `hard` | Panning law. Must match the `atmos` run. |
+| `--pan hard71\|hard51\|vbap` | `hard71` | Panning law. Must match the `atmos` run. |
 | `--gain-db DB` | `0` | Makeup gain on the five main channels (not LFE). |
 | `--surround-phase-shift` | off | Apply DME's +90° Ls/Rs all-pass. |
 
@@ -138,7 +140,7 @@ Do not mix the two: flag 3 requires a genuinely shifted core.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--out PATH` | `atmos.eac3` | Output E-AC-3. |
-| `--pan hard\|vbap` | `hard` | Must match the `downmix` run. |
+| `--pan hard71\|hard51\|vbap` | `hard71` | Must match the `downmix` run. |
 | `--core-pcm PATH` | — | Decoded 5.1 core as raw f32le; `-` = stdin. Omit for the ideal downmix. |
 | `--core-delay N` | `256` | Samples to skip at the start of `--core-pcm` (ffmpeg E-AC-3). |
 | `--joc-lambda F` | `1e-3` | Huffman-aware RD weight; `0` disables refinement. |

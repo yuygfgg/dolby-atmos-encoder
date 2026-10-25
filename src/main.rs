@@ -75,8 +75,9 @@ enum Command {
         /// Makeup gain applied to the 5 main channels, in dB.
         #[arg(long, default_value_t = 0.0)]
         gain_db: f64,
-        /// Downmix panning law: `hard` (DME-style nearest-speaker + height trim) or `vbap`.
-        #[arg(long, value_enum, default_value = "hard")]
+        /// Downmix panning law: `hard71` (default; 7.1 nearest-speaker with `Lrs`/`Rrs` folded into
+        /// `Ls`/`Rs`), `hard51` (5.1 nearest-speaker), or `vbap`.
+        #[arg(long, value_enum, default_value = "hard71")]
         pan: render::PanMode,
         /// Apply DME's +90° surround all-pass to Ls/Rs before E-AC-3. Pair with
         /// `atmos --surround-phase-shift`, which writes `joc_dmx_config_idx=3`.
@@ -123,8 +124,9 @@ enum Command {
         /// Output E-AC-3 path.
         #[arg(short, long, default_value = "atmos.eac3")]
         out: PathBuf,
-        /// Downmix panning law used for JOC analysis (must match the `downmix` run).
-        #[arg(long, value_enum, default_value = "hard")]
+        /// Downmix panning law used for JOC analysis (must match the `downmix` run: `hard71`,
+        /// `hard51`, or `vbap`).
+        #[arg(long, value_enum, default_value = "hard71")]
         pan: render::PanMode,
         /// Optional decoded 5.1 core PCM (raw f32le, 6 channels, 48 kHz) for JOC analysis.
         /// Use `-` to read from stdin. Omit to synthesize the ideal downmix.
