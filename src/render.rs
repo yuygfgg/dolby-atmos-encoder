@@ -178,6 +178,14 @@ pub(crate) fn s24be(b: &[u8]) -> f32 {
     v as f32 / 8_388_608.0
 }
 
+/// A 24-bit little-endian PCM sample → f32 in [-1, 1).
+#[inline]
+pub(crate) fn s24le(b: &[u8]) -> f32 {
+    let v = ((b[2] as i32) << 16) | ((b[1] as i32) << 8) | (b[0] as i32);
+    let v = (v << 8) >> 8; // sign-extend 24 → 32
+    v as f32 / 8_388_608.0
+}
+
 /// One object's panning timeline: essence channel + (samplePos, gains) keyframes.
 pub(crate) struct ObjEnv {
     pub(crate) ess_ch: usize,
@@ -197,7 +205,10 @@ impl ObjEnv {
         let (p0, g0) = self.keys[self.cursor];
         if self.cursor + 1 < self.keys.len() {
             let (p1, g1) = self.keys[self.cursor + 1];
-            let frac = if p1 > p0 {
+            // `t` can precede the first keyframe (DRP-exported metadata starts at the
+            // decoder delay, e.g. samplePos 1473). Hold the first pan position instead of
+            // underflowing the unsigned subtraction.
+            let frac = if p1 > p0 && t > p0 {
                 ((t - p0) as f32) / ((p1 - p0) as f32)
             } else {
                 0.0
@@ -266,6 +277,9 @@ pub fn downmix(
         "expected 24-bit int CAF essence"
     );
     let channels = caf.channels as usize;
+    // `atmos_tools.py` writes little-endian CAF (`pcm_s24le` copy); truehdd masters are
+    // usually big-endian. Honour the `desc` format flag in both directions.
+    let s24: fn(&[u8]) -> f32 = if caf.is_big_endian() { s24be } else { s24le };
 
     // Element ID → essence channel: bed channels first (manifest order), then objects.
     let mut id_to_ch: HashMap<u32, usize> = HashMap::new();
@@ -359,11 +373,11 @@ pub fn downmix(
             let mut o = [0f32; 6];
             // LFE bed passes through.
             if let Some(lc) = lfe_ch {
-                o[3] = s24be(&inbuf[base + lc * 3..base + lc * 3 + 3]);
+                o[3] = s24(&inbuf[base + lc * 3..base + lc * 3 + 3]);
             }
             // Objects panned to the 5 mains.
             for obj in &mut objects {
-                let s = s24be(&inbuf[base + obj.ess_ch * 3..base + obj.ess_ch * 3 + 3]);
+                let s = s24(&inbuf[base + obj.ess_ch * 3..base + obj.ess_ch * 3 + 3]);
                 if s == 0.0 {
                     obj.gains_at(t); // keep cursor advancing
                     continue;
@@ -583,5 +597,41 @@ mod tests {
             0.867 * SURROUND_HEIGHT_TRIM
         ));
         assert!(approx(pan_hard71(0.0, 1.0, 1.0)[2], FRONT_HEIGHT_TRIM));
+    }
+
+    #[test]
+    fn gains_before_first_keyframe_hold_first_position() {
+        let g0 = pan_hard71(-1.0, 1.0, 0.0);
+        let g1 = pan_hard71(1.0, 1.0, 0.0);
+        let mut env = ObjEnv {
+            ess_ch: 1,
+            keys: vec![(1473, g0), (1473 + 1536, g1)],
+            cursor: 0,
+        };
+        // t precedes the first keyframe (DRP export starts at the decoder delay).
+        assert_eq!(env.gains_at(0), g0);
+        assert_eq!(env.gains_at(1000), g0);
+        assert_eq!(env.gains_at(1473), g0);
+        // Interpolation starts once t is inside the segment.
+        let g = env.gains_at(1473 + 768);
+        for k in 0..5 {
+            assert!(g[k].is_finite());
+            assert!(g[k].abs() <= 1.5);
+        }
+    }
+
+    #[test]
+    fn s24_endianness_round_trip() {
+        // +0x010203 and -0x000002.
+        assert!(approx(
+            s24be(&[0x01, 0x02, 0x03]),
+            0x010203 as f32 / 8_388_608.0
+        ));
+        assert!(approx(
+            s24le(&[0x03, 0x02, 0x01]),
+            0x010203 as f32 / 8_388_608.0
+        ));
+        assert!(approx(s24be(&[0xff, 0xff, 0xfe]), -2.0 / 8_388_608.0));
+        assert!(approx(s24le(&[0xfe, 0xff, 0xff]), -2.0 / 8_388_608.0));
     }
 }

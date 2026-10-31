@@ -317,6 +317,7 @@ pub(crate) struct JocAnalyzer {
     band_bins: [(usize, usize); ENC_BANDS],
     bed_channels: usize,
     channels: usize,
+    big_endian: bool,
     nobj: usize,
     nsig: usize,
     objects: Vec<render::ObjEnv>,
@@ -436,6 +437,7 @@ impl JocAnalyzer {
             band_bins,
             bed_channels,
             channels,
+            big_endian: caf.is_big_endian(),
             nobj,
             nsig,
             objects,
@@ -523,7 +525,11 @@ impl JocAnalyzer {
                 Some(base) => {
                     let p = base + (self.bed_channels + o) * 3;
                     if p + 3 <= self.inbuf.len() {
-                        render::s24be(&self.inbuf[p..p + 3])
+                        if self.big_endian {
+                            render::s24be(&self.inbuf[p..p + 3])
+                        } else {
+                            render::s24le(&self.inbuf[p..p + 3])
+                        }
                     } else {
                         0.0
                     }
